@@ -1,0 +1,126 @@
+//! Model implementations.
+//!
+//! We use candle-transformers' model implementations directly, wrapping them
+//! with a unified trait for the engine to use.
+
+use anyhow::Result;
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use std::path::Path;
+
+use crate::config::{ModelArchitecture, RawConfig};
+/// Unified model interface for the engine.
+pub trait CausalLM: Send {
+    /// Run a forward pass on the given input token IDs.
+    /// Returns logits for the last token position: shape (batch_size, 1, vocab_size).
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor>;
+
+    /// Clear all KV caches (for starting a new sequence).
+    fn clear_kv_cache(&mut self);
+}
+
+/// A Qwen2 model wrapper.
+struct Qwen2Model {
+    inner: candle_transformers::models::qwen2::ModelForCausalLM,
+}
+
+impl CausalLM for Qwen2Model {
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let logits = self.inner.forward(input_ids, seqlen_offset)?;
+        Ok(logits)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.inner.clear_kv_cache();
+    }
+}
+
+/// A Gemma2 model wrapper.
+struct Gemma2Model {
+    inner: candle_transformers::models::gemma2::Model,
+}
+
+impl CausalLM for Gemma2Model {
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let logits = self.inner.forward(input_ids, seqlen_offset)?;
+        Ok(logits)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.inner.clear_kv_cache();
+    }
+}
+
+/// A Gemma3 model wrapper.
+struct Gemma3Model {
+    inner: candle_transformers::models::gemma3::Model,
+}
+
+impl CausalLM for Gemma3Model {
+    fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let logits = self.inner.forward(input_ids, seqlen_offset)?;
+        Ok(logits)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.inner.clear_kv_cache();
+    }
+}
+
+/// Load a model from weight files.
+pub fn load_model(
+    raw_config: &RawConfig,
+    arch: &ModelArchitecture,
+    weight_paths: &[impl AsRef<Path>],
+    dtype: DType,
+    device: &Device,
+) -> Result<Box<dyn CausalLM>> {
+    tracing::info!("Loading model weights ({:?} architecture)...", arch);
+
+    let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
+
+    // Load safetensors into a VarBuilder
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? };
+
+    match arch {
+        ModelArchitecture::Qwen2 => {
+            let config = raw_config.to_qwen2_config();
+            tracing::info!(
+                "Qwen2 config: {} layers, {} heads, {} hidden, {} kv_heads",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.num_key_value_heads
+            );
+            let model = candle_transformers::models::qwen2::ModelForCausalLM::new(&config, vb)?;
+            tracing::info!("Model loaded successfully");
+            Ok(Box::new(Qwen2Model { inner: model }))
+        }
+        ModelArchitecture::Gemma2 => {
+            let config = raw_config.to_gemma2_config();
+            tracing::info!(
+                "Gemma2 config: {} layers, {} heads, {} hidden, {} head_dim",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.head_dim
+            );
+            let model = candle_transformers::models::gemma2::Model::new(false, &config, vb)?;
+            tracing::info!("Model loaded successfully");
+            Ok(Box::new(Gemma2Model { inner: model }))
+        }
+        ModelArchitecture::Gemma3 => {
+            let config = raw_config.to_gemma3_config();
+            tracing::info!(
+                "Gemma3 config: {} layers, {} heads, {} hidden, {} head_dim",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.head_dim
+            );
+            let model = candle_transformers::models::gemma3::Model::new(false, &config, vb)?;
+            tracing::info!("Model loaded successfully");
+            Ok(Box::new(Gemma3Model { inner: model }))
+        }
+    }
+}
