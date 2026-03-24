@@ -51,7 +51,7 @@ pub struct Engine {
     model: Box<dyn CausalLM>,
     tokenizer: Tokenizer,
     device: Device,
-    eos_token_id: Option<u32>,
+    stop_token_ids: Vec<u32>,
     #[allow(dead_code)]
     max_batch_size: usize,
     #[allow(dead_code)]
@@ -66,12 +66,12 @@ impl Engine {
         max_batch_size: usize,
         max_tokens_per_step: usize,
     ) -> Self {
-        let eos_token_id = tokenizer.eos_token_id;
+        let stop_token_ids = tokenizer.stop_token_ids.clone();
         Self {
             model,
             tokenizer,
             device,
-            eos_token_id,
+            stop_token_ids,
             max_batch_size,
             max_tokens_per_step,
         }
@@ -278,10 +278,8 @@ impl Engine {
         num_output_tokens: usize,
         params: &SamplingParams,
     ) -> Option<String> {
-        if let Some(eos_id) = self.eos_token_id {
-            if token_id == eos_id {
-                return Some("stop".to_string());
-            }
+        if self.stop_token_ids.contains(&token_id) {
+            return Some("stop".to_string());
         }
         if num_output_tokens >= params.max_tokens {
             return Some("length".to_string());

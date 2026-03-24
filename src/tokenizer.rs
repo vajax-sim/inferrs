@@ -35,6 +35,8 @@ pub struct ChatMessage {
 pub enum ChatTemplate {
     /// ChatML format: <|im_start|>role\ncontent<|im_end|>
     ChatML,
+    /// Qwen3.5 ChatML with thinking disabled (<think>\n\n</think>\n\n prefix on assistant turn)
+    Qwen35,
     /// Gemma2 format: <start_of_turn>role\ncontent<end_of_turn> with BOS prefix
     Gemma,
     /// Gemma3 format: <start_of_turn>role\ncontent<end_of_turn> without BOS prefix, model turn
@@ -87,7 +89,10 @@ pub struct Tokenizer {
     pub chat_template: ChatTemplate,
     #[allow(dead_code)]
     pub eos_token: Option<String>,
+    #[allow(dead_code)]
     pub eos_token_id: Option<u32>,
+    /// All token IDs that should stop generation (EOS + any additional stop tokens).
+    pub stop_token_ids: Vec<u32>,
     pub bos_token: Option<String>,
 }
 
@@ -107,11 +112,26 @@ impl Tokenizer {
 
         let bos_token = config.as_ref().and_then(|c| c.bos_token_str());
 
+        // Collect all stop token IDs: the declared EOS token plus any well-known
+        // additional stop tokens present in the vocabulary.
+        let mut stop_token_ids: Vec<u32> = Vec::new();
+        if let Some(id) = eos_token_id {
+            stop_token_ids.push(id);
+        }
+        for extra in &["<|endoftext|>", "<|im_end|>", "<end_of_turn>"] {
+            if let Some(id) = inner.token_to_id(extra) {
+                if !stop_token_ids.contains(&id) {
+                    stop_token_ids.push(id);
+                }
+            }
+        }
+
         tracing::info!(
-            "Tokenizer loaded: template={:?}, eos={:?} (id={:?})",
+            "Tokenizer loaded: template={:?}, eos={:?} (id={:?}), stop_ids={:?}",
             chat_template,
             eos_token,
             eos_token_id,
+            stop_token_ids,
         );
 
         Ok(Self {
@@ -119,6 +139,7 @@ impl Tokenizer {
             chat_template,
             eos_token,
             eos_token_id,
+            stop_token_ids,
             bos_token,
         })
     }
@@ -145,6 +166,7 @@ impl Tokenizer {
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
         let prompt = match &self.chat_template {
             ChatTemplate::ChatML => apply_chatml(messages, &self.bos_token),
+            ChatTemplate::Qwen35 => apply_qwen35(messages),
             ChatTemplate::Gemma => apply_gemma(messages, &self.bos_token),
             ChatTemplate::Gemma3 => apply_gemma3(messages),
             ChatTemplate::Generic => apply_generic(messages),
@@ -169,6 +191,11 @@ fn detect_chat_template(config: &Option<TokenizerConfig>) -> ChatTemplate {
     if let Some(config) = config {
         if let Some(template) = &config.chat_template {
             if template.contains("im_start") || template.contains("im_end") {
+                // Qwen3.5 templates contain "enable_thinking" and need the no-think
+                // prefix on the assistant turn to suppress the chain-of-thought block.
+                if template.contains("enable_thinking") {
+                    return ChatTemplate::Qwen35;
+                }
                 return ChatTemplate::ChatML;
             }
             if template.contains("start_of_turn") || template.contains("end_of_turn") {
@@ -200,6 +227,27 @@ fn apply_chatml(messages: &[ChatMessage], _bos_token: &Option<String>) -> String
     }
     // Add the assistant turn marker
     prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
+/// Qwen3.5 ChatML template with thinking disabled.
+///
+/// Identical to ChatML but appends `<think>\n\n</think>\n\n` after the
+/// `<|im_start|>assistant\n` prefix.  This matches the model's chat template
+/// when `enable_thinking=false`, which instructs the model to emit an empty
+/// thinking block and proceed directly to the answer.  Without this prefix
+/// the model enters thinking mode and prepends a long chain-of-thought before
+/// the actual reply.
+fn apply_qwen35(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        prompt.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role, msg.content
+        ));
+    }
+    // Add the assistant turn marker with the no-think prefix
+    prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
     prompt
 }
 
@@ -351,6 +399,27 @@ mod tests {
             detect_chat_template(&config),
             ChatTemplate::ChatML
         ));
+    }
+
+    #[test]
+    fn detect_qwen35_from_template_string() {
+        let config = Some(TokenizerConfig {
+            chat_template: Some("<|im_start|>...enable_thinking...".to_string()),
+            bos_token: None,
+            eos_token: None,
+        });
+        assert!(matches!(
+            detect_chat_template(&config),
+            ChatTemplate::Qwen35
+        ));
+    }
+
+    #[test]
+    fn qwen35_template_has_no_think_prefix() {
+        let msgs = vec![user_msg("Hello!")];
+        let prompt = apply_qwen35(&msgs);
+        assert!(prompt.contains("<|im_start|>user\nHello!<|im_end|>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     }
 
     #[test]

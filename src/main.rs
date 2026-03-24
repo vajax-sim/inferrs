@@ -35,7 +35,7 @@ pub struct ServeArgs {
     pub revision: String,
 
     /// Weight data type: f32, f16, bf16
-    #[arg(long, default_value = "f32")]
+    #[arg(long, default_value = "bf16")]
     pub dtype: String,
 
     /// Maximum sequence length (0 = model default)
