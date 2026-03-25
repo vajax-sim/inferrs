@@ -15,7 +15,6 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 | **Streaming (SSE)** | ✓ | ✓ | ✓ |
 | **Chunked prefill** | ✓ | ✓ | ✗ |
 | **KV cache management** | Per-context allocation/PagedAttention | PagedAttention | Per-context allocation |
-| **Multi-GPU / distributed** | Single device | Multi-GPU, tensor parallel | Partial (model splitting) |
 | **Desktop friendly** | ✓ — lightweight | ✗ — claims most GPU memory | ✓ — lightweight |
 | **Binary footprint** | Single static binary | Python environment + deps | Single binary |
 
@@ -23,14 +22,7 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`,
   `/v1/models`, `/health`
-- **Server-Sent Events** streaming
-- **Continuous batching** with chunked prefill and preemption
-- **Block-based KV cache** with free-list reuse
-- **Chat templates** — ChatML and Llama formats
-- **Sampling** — temperature, top-k, top-p, repetition penalty
-- **HuggingFace Hub** — downloads models and tokenizers on first run
 - **Hardware backends** — CPU, CUDA (NVIDIA), Metal (Apple Silicon)
-- **Model architectures** — Qwen2, Llama, Mistral, and other standard
   decoder-only transformers (safetensors format)
 
 ## Quick start
@@ -97,5 +89,4 @@ curl http://localhost:8080/v1/chat/completions \
 - **Engine** — Owns the model and runs the inference loop on a dedicated thread.
 - **Scheduler** — Continuous batching with chunked prefill and preemption.
 - **KV Cache** — Block-based, grow-on-demand allocation with free-list reuse.
-- **Sampler** — Temperature, top-k, top-p, and repetition penalty.
 
