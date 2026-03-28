@@ -234,11 +234,15 @@ impl FullAttention {
         let (b, t, _) = x.dims3()?;
 
         // Project
-        // q_proj outputs [b, t, num_heads * head_dim * 2]; split into query + gate
+        // q_proj outputs [b, t, num_heads * head_dim * 2].
+        // The weight layout is interleaved per-head: [h0_query, h0_gate, h1_query, h1_gate, ...]
+        // so we must reshape to [b, t, num_heads, head_dim * 2] BEFORE splitting query vs gate.
         let q_full = self.q_proj.forward(x)?; // [b, t, num_heads * head_dim * 2]
-        let attn_dim = self.num_heads * self.head_dim;
-        let q_raw = q_full.narrow(2, 0, attn_dim)?; // [b, t, num_heads * head_dim]
-        let gate = q_full.narrow(2, attn_dim, attn_dim)?; // [b, t, num_heads * head_dim]
+        let q_full_heads = q_full.reshape((b, t, self.num_heads, self.head_dim * 2))?;
+        let q_raw = q_full_heads.narrow(3, 0, self.head_dim)?; // [b, t, num_heads, head_dim]
+        let gate = q_full_heads
+            .narrow(3, self.head_dim, self.head_dim)? // [b, t, num_heads, head_dim]
+            .reshape((b, t, self.num_heads * self.head_dim))?; // [b, t, num_heads * head_dim]
 
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
@@ -339,10 +343,14 @@ impl FullAttention {
         let (b, t, _) = x.dims3()?;
 
         // ── Project ──────────────────────────────────────────────────────────
-        let q_full = self.q_proj.forward(x)?;
-        let attn_dim = self.num_heads * self.head_dim;
-        let q_raw = q_full.narrow(2, 0, attn_dim)?;
-        let gate = q_full.narrow(2, attn_dim, attn_dim)?;
+        // q_proj weight layout is interleaved per-head: [h0_query, h0_gate, h1_query, h1_gate, ...]
+        // reshape to [b, t, num_heads, head_dim * 2] before splitting.
+        let q_full = self.q_proj.forward(x)?; // [b, t, num_heads * head_dim * 2]
+        let q_full_heads = q_full.reshape((b, t, self.num_heads, self.head_dim * 2))?;
+        let q_raw = q_full_heads.narrow(3, 0, self.head_dim)?; // [b, t, num_heads, head_dim]
+        let gate = q_full_heads
+            .narrow(3, self.head_dim, self.head_dim)? // [b, t, num_heads, head_dim]
+            .reshape((b, t, self.num_heads * self.head_dim))?; // [b, t, num_heads * head_dim]
 
         let k_proj_out = self.k_proj.forward(x)?; // [b, t, num_kv_heads * head_dim]
         let v_proj_out = self.v_proj.forward(x)?;
@@ -474,79 +482,98 @@ fn causal_mask(
 }
 
 // ---------------------------------------------------------------------------
-// Linear attention (Mamba2 / SSM) layer
+// Linear attention (Gated Delta Rule) layer
 // ---------------------------------------------------------------------------
 //
+// Qwen3.5 uses the "GatedDeltaNet" algorithm from flash-linear-attention.
+// Reference: transformers/models/qwen3_5/modeling_qwen3_5.py
+//
 // Tensor layout from weights:
-//   in_proj_qkv:  [6144, hidden]   -- projects to [q, k, v] interleaved
-//   in_proj_z:    [2*hidden, hidden] -- gating
-//   in_proj_a:    [n_heads, hidden] -- dt_rank projection
-//   in_proj_b:    [n_heads, hidden] -- B (key-side)
-//   conv1d:       [6144, 1, 4]      -- depthwise conv on channels
-//   A_log:        [n_heads]         -- log(-A), stored as F32
-//   dt_bias:      [n_heads]         -- delta bias
-//   norm:         [head_dim]        -- output norm (F32 weight, applied as simple RMSNorm)
-//   out_proj:     [hidden, 2*hidden]
+//   in_proj_qkv:  [key_dim*2 + value_dim, hidden]  -- projects q+k in key space, v in value space
+//   in_proj_z:    [value_dim, hidden]               -- gate for output RMSNorm
+//   in_proj_a:    [n_heads, hidden]                 -- per-head decay input
+//   in_proj_b:    [n_heads, hidden]                 -- per-head beta (write strength)
+//   conv1d:       [key_dim*2+value_dim, 1, kernel]  -- depthwise causal conv on qkv
+//   A_log:        [n_heads]                         -- log(A), stored as F32
+//   dt_bias:      [n_heads]                         -- bias for decay gate, F32
+//   norm:         [head_v_dim]                      -- weight for gated RMSNorm, F32
+//   out_proj:     [hidden, value_dim]
 //
-// dim breakdown:
-//   n_heads = linear_num_key_heads = 16
-//   head_dim = linear_key_head_dim = 128 (= value_head_dim too)
-//   So q+k+v = 16*(128+128+128) = 6144  = in_proj_qkv rows  ✓
-//   z = 2*hidden = 2*1024 = 2048  ✓
-//   out = hidden, in = n_heads * v_head_dim = 16*128 = 2048  ✓
+// dim breakdown for 0.8B:
+//   n_heads     = linear_num_k_heads = linear_num_v_heads = 16
+//   head_k_dim  = linear_key_head_dim   = 128
+//   head_v_dim  = linear_value_head_dim = 128
+//   key_dim     = n_heads * head_k_dim  = 2048
+//   value_dim   = n_heads * head_v_dim  = 2048
+//   conv_dim    = key_dim*2 + value_dim = 6144
 //
-// Inference (recurrent mode, one token at a time after prefill):
-//   We use a simplified recurrent SSM approximation.
-//   For prefill (many tokens), we process sequentially for correctness.
+// The recurrence (Gated Delta Rule):
+//   g_t  = exp( -A_log.exp() * softplus(a_t + dt_bias) )   [per-head decay]
+//   beta_t = sigmoid(b_t)                                    [per-head write strength]
+//   q, k = l2norm(q), l2norm(k)                              [normalise]
+//   q   *= 1/sqrt(head_k_dim)                                [scale]
+//   For each timestep t:
+//     state = state * g_t                                     [decay]
+//     kv_mem = einsum("nhd,nhdk->nhk", k_t, state)           [read from state]
+//     delta  = (v_t - kv_mem) * beta_t                       [delta update]
+//     state += k_t[:,:,:,None] * delta[:,:,None,:]           [write to state]
+//     out_t  = einsum("nhd,nhdk->nhk", q_t, state)           [read output]
+//   out = gated_rms_norm(out, z)   -- norm(out) * silu(z)
+//   out = out_proj(out)
 
 struct LinearAttn {
     in_proj_qkv: Linear,
     in_proj_z: Linear,
-    in_proj_a: Linear,     // dt
-    in_proj_b: Linear,     // B
-    conv1d_weight: Tensor, // [inner, 1, kernel]
+    in_proj_a: Linear,     // per-head decay input
+    in_proj_b: Linear,     // per-head write strength (beta before sigmoid)
+    conv1d_weight: Tensor, // [conv_dim, 1, kernel], conv_dim = key_dim*2 + value_dim
     a_log: Tensor,         // [n_heads], F32
-    dt_bias: Tensor,       // [n_heads]
-    norm_weight: Tensor,   // [head_dim], F32
+    dt_bias: Tensor,       // [n_heads], F32
+    norm_weight: Tensor,   // [head_v_dim], F32 -- weight for gated RMSNorm
     out_proj: Linear,
     n_heads: usize,
-    head_dim: usize,
-    inner_dim: usize, // = n_heads * head_dim (for q+k+v each)
-    // SSM state: [1, n_heads, head_dim, head_dim] for each of k*v outer product
-    ssm_state: Option<Tensor>,
-    // Conv state: [1, inner_dim * 3, kernel-1]  (circular buffer for the 3-part qkv channels)
+    head_k_dim: usize, // = linear_key_head_dim
+    head_v_dim: usize, // = linear_value_head_dim
+    key_dim: usize,    // = n_heads * head_k_dim
+    value_dim: usize,  // = n_heads * head_v_dim
+    // Recurrent state: [b, n_heads, head_k_dim, head_v_dim], F32
+    recurrent_state: Option<Tensor>,
+    // Conv state: [b, conv_dim, kernel-1], used for causal padding across calls
     conv_state: Option<Tensor>,
 }
 
 impl LinearAttn {
     fn new(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
-        let n_heads = cfg.linear_num_key_heads;
-        let head_dim = cfg.linear_key_head_dim;
-        let inner_dim = n_heads * head_dim; // = 2048 for 0.8B
+        let n_heads = cfg.linear_num_key_heads; // = linear_num_value_heads
+        let head_k_dim = cfg.linear_key_head_dim;
+        let head_v_dim = cfg.linear_value_head_dim;
+        let key_dim = n_heads * head_k_dim;
+        let value_dim = n_heads * head_v_dim;
+        let conv_dim = key_dim * 2 + value_dim; // = 3 * key_dim when head_k == head_v
         let hidden = cfg.hidden_size;
         let kernel = cfg.linear_conv_kernel_dim;
 
-        // in_proj_qkv projects to q+k+v = 3 * inner_dim
-        let in_proj_qkv = linear_no_bias(hidden, 3 * inner_dim, vb.pp("in_proj_qkv"))?;
-        let in_proj_z = linear_no_bias(hidden, 2 * hidden, vb.pp("in_proj_z"))?;
+        // in_proj_qkv: hidden -> q(key_dim) + k(key_dim) + v(value_dim)
+        let in_proj_qkv = linear_no_bias(hidden, conv_dim, vb.pp("in_proj_qkv"))?;
+        // in_proj_z: hidden -> value_dim  (feeds as gate into gated RMSNorm)
+        let in_proj_z = linear_no_bias(hidden, value_dim, vb.pp("in_proj_z"))?;
         let in_proj_a = linear_no_bias(hidden, n_heads, vb.pp("in_proj_a"))?;
         let in_proj_b = linear_no_bias(hidden, n_heads, vb.pp("in_proj_b"))?;
 
-        // conv1d weight: [3*inner_dim, 1, kernel] -- depthwise
-        let conv1d_weight = vb.get((3 * inner_dim, 1, kernel), "conv1d.weight")?;
+        // conv1d weight: [conv_dim, 1, kernel] -- depthwise
+        let conv1d_weight = vb.get((conv_dim, 1, kernel), "conv1d.weight")?;
 
-        // Cast A_log, dt_bias, norm_weight to model dtype at load time so we don't
-        // do repeated dtype conversions during every forward pass.
-        let dtype = cfg.dtype;
+        // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
         let a_log = vb
             .get_with_hints(n_heads, "A_log", candle_nn::Init::Const(0.0))?
-            .to_dtype(dtype)?;
-        let dt_bias = vb.get((n_heads,), "dt_bias")?.to_dtype(dtype)?;
+            .to_dtype(DType::F32)?;
+        let dt_bias = vb.get((n_heads,), "dt_bias")?.to_dtype(DType::F32)?;
         let norm_weight = vb
-            .get_with_hints(head_dim, "norm.weight", candle_nn::Init::Const(1.0))?
-            .to_dtype(dtype)?;
+            .get_with_hints(head_v_dim, "norm.weight", candle_nn::Init::Const(1.0))?
+            .to_dtype(DType::F32)?;
 
-        let out_proj = linear_no_bias(2 * hidden, hidden, vb.pp("out_proj"))?;
+        // out_proj: value_dim -> hidden
+        let out_proj = linear_no_bias(value_dim, hidden, vb.pp("out_proj"))?;
 
         Ok(Self {
             in_proj_qkv,
@@ -559,210 +586,182 @@ impl LinearAttn {
             norm_weight,
             out_proj,
             n_heads,
-            head_dim,
-            inner_dim,
-            ssm_state: None,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            recurrent_state: None,
             conv_state: None,
         })
     }
 
     fn clear_state(&mut self) {
-        self.ssm_state = None;
+        self.recurrent_state = None;
         self.conv_state = None;
     }
 
-    /// Process a sequence of tokens through the linear attention layer.
+    /// L2-normalise the last dimension of x.
+    /// x: [..., d]
+    fn l2norm(x: &Tensor) -> Result<Tensor> {
+        let eps = 1e-6f64;
+        // sum of squares over last dim, keepdim
+        let norm_sq = x.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+        let inv_norm = (norm_sq + eps)?.sqrt()?.recip()?;
+        x.broadcast_mul(&inv_norm).map_err(Into::into)
+    }
+
+    /// Process a sequence of tokens through the Gated Delta Rule linear attention layer.
     /// x: [batch=1, seq_len, hidden]
     /// Returns: [1, seq_len, hidden]
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         let (b, t, _) = x.dims3()?;
         let device = x.device().clone();
-        let dtype = x.dtype(); // used for SSM state init and conv1d
+        let dtype = x.dtype();
 
-        // Project inputs
-        let qkv = self.in_proj_qkv.forward(x)?; // [b, t, 3*inner]
-        let z = self.in_proj_z.forward(x)?; // [b, t, 2*hidden]
-        let dt_input = self.in_proj_a.forward(x)?; // [b, t, n_heads]  (delta)
-        let b_input = self.in_proj_b.forward(x)?; // [b, t, n_heads]  (B)
+        // ── Projections ───────────────────────────────────────────────────────
+        let qkv = self.in_proj_qkv.forward(x)?; // [b, t, key_dim*2 + value_dim]
+        let z = self.in_proj_z.forward(x)?; // [b, t, value_dim]
+        let a_input = self.in_proj_a.forward(x)?; // [b, t, n_heads]  (decay gate input)
+        let b_input = self.in_proj_b.forward(x)?; // [b, t, n_heads]  (beta input, before sigmoid)
 
-        // Apply depthwise conv1d to qkv channels
-        let qkv = self.apply_conv1d(&qkv)?; // [b, t, 3*inner]
+        // ── Depthwise causal conv1d on qkv, then SiLU ────────────────────────
+        let qkv = self.apply_conv1d_silu(&qkv)?; // [b, t, key_dim*2 + value_dim]
 
-        // Split qkv -> q, k, v each [b, t, inner]
-        let q = qkv.narrow(2, 0, self.inner_dim)?;
-        let k = qkv.narrow(2, self.inner_dim, self.inner_dim)?;
-        let v = qkv.narrow(2, 2 * self.inner_dim, self.inner_dim)?;
+        // Split: q and k are in key space, v is in value space
+        let q = qkv.narrow(2, 0, self.key_dim)?; // [b, t, key_dim]
+        let k = qkv.narrow(2, self.key_dim, self.key_dim)?; // [b, t, key_dim]
+        let v = qkv.narrow(2, self.key_dim * 2, self.value_dim)?; // [b, t, value_dim]
 
-        // Reshape to [b, t, n_heads, head_dim]
-        let q = q.reshape((b, t, self.n_heads, self.head_dim))?;
-        let k = k.reshape((b, t, self.n_heads, self.head_dim))?;
-        let v = v.reshape((b, t, self.n_heads, self.head_dim))?;
+        // Reshape to per-head: [b, t, n_heads, head_dim]
+        let q = q.reshape((b, t, self.n_heads, self.head_k_dim))?;
+        let k = k.reshape((b, t, self.n_heads, self.head_k_dim))?;
+        let v = v.reshape((b, t, self.n_heads, self.head_v_dim))?;
 
-        // Compute A = -exp(a_log): [n_heads]  (a_log already in model dtype)
-        let a: Tensor = self.a_log.neg()?.exp()?; // positive magnitudes -> use as decay
+        // ── L2-normalize q and k, then scale q ───────────────────────────────
+        let q = Self::l2norm(&q)?;
+        let k = Self::l2norm(&k)?;
+        let scale = (self.head_k_dim as f64).sqrt().recip();
+        let q = q.affine(scale, 0.0)?;
 
-        // dt (delta): softplus(dt_input + dt_bias)  (dt_bias already in model dtype)
-        let dt = dt_input.broadcast_add(&self.dt_bias.reshape((1, 1, self.n_heads))?)?;
-        let dt = softplus(&dt)?; // [b, t, n_heads]
+        // ── Compute per-head decay gate g  ────────────────────────────────────
+        // g_t = exp( -A_log.exp() * softplus(a_t + dt_bias) )
+        // All in F32.
+        let a_f32 = a_input.to_dtype(DType::F32)?; // [b, t, n_heads]
+        let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_heads))?; // broadcast
+        let sp_input = a_f32.broadcast_add(&dt_bias_bc)?; // [b, t, n_heads]
+        let sp = softplus(&sp_input)?; // [b, t, n_heads]
+                                       // g = exp( -A * sp )  where A = exp(A_log)
+        let a_exp = self.a_log.exp()?; // [n_heads], F32
+        let a_exp_bc = a_exp.reshape((1, 1, self.n_heads))?;
+        let log_g = a_exp_bc.broadcast_mul(&sp)?.neg()?; // [b, t, n_heads]
+        let g = log_g.exp()?; // [b, t, n_heads]  -- per-head decay per token
 
-        // Process tokens sequentially through the SSM recurrence
-        // state shape: [b, n_heads, head_dim, head_dim]  (outer product of k and v)
-        let mut state = match &self.ssm_state {
+        // ── beta = sigmoid(b_input) ───────────────────────────────────────────
+        let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_heads]
+                                                   // sigmoid(x) = 1 / (1 + exp(-x))
+        let beta = (b_f32.neg()?.exp()? + 1.0)?.recip()?; // [b, t, n_heads]
+
+        // ── Cast q, k, v to F32 for the recurrence ────────────────────────────
+        let q_f32 = q.to_dtype(DType::F32)?; // [b, t, n_heads, head_k_dim]
+        let k_f32 = k.to_dtype(DType::F32)?; // [b, t, n_heads, head_k_dim]
+        let v_f32 = v.to_dtype(DType::F32)?; // [b, t, n_heads, head_v_dim]
+
+        // ── Initialise recurrent state ────────────────────────────────────────
+        // state: [b, n_heads, head_k_dim, head_v_dim]  F32
+        let mut state = match &self.recurrent_state {
             None => Tensor::zeros(
-                (b, self.n_heads, self.head_dim, self.head_dim),
-                dtype,
+                (b, self.n_heads, self.head_k_dim, self.head_v_dim),
+                DType::F32,
                 &device,
             )?,
             Some(s) => s.clone(),
         };
 
-        // SSM recurrence: s_t = decay_t * s_{t-1} + k_t⊗v_t,  y_t = q_t @ s_t
+        // ── Gated Delta Rule recurrence ───────────────────────────────────────
+        // For each timestep t:
+        //   state = state * g_t                         [decay]
+        //   kv_mem = (state * k_t[:, None, :]).sum(-2)  [read: k_t dot state along head_k_dim]
+        //   delta  = (v_t - kv_mem) * beta_t            [delta correction]
+        //   state += k_t[:, :, None] * delta[:, None, :] [write outer product]
+        //   out_t  = (state * q_t[:, None, :]).sum(-2)  [read output]
         //
-        // We implement both decode (t=1) and prefill (t>1) paths.
-        // For prefill we use a parallel-scan approach based on cumsum to avoid
-        // a sequential Rust loop that dispatches many small GPU kernels.
-        //
-        // Key identity: y_t = q_t @ [ Σ_{i<=t} w_{t,i} * outer(k_i,v_i) ] + w_{t,init} * (q_t @ s0)
-        //   where w_{t,i} = exp( Σ_{j=i+1}^{t} log_d_j )
-        //                 = exp( log_d_cum[t] - log_d_cum[i] )
-        //   and log_d_cum[t] = Σ_{j=1}^{t} log_d_j  (cumulative sum)
-        //
-        // Equivalently: causal_weight[t,i] = exp(log_d_cum[t] - log_d_cum[i])  for i<=t, else 0
-        //
-        // Steps (all vectorised):
-        //  1. log_d[b,t,h]      = -a[h] * dt[b,t,h]
-        //  2. log_d_cum[b,t,h]  = cumsum(log_d, dim=1)
-        //  3. scale[b,t,h]      = exp(log_d_cum[b,t,h] - log_d_cum[b,t,h] for each token)
-        //                       → implemented as lower-triangular weight matrix W[b,h,t,t]
-        //                         W[b,h,t,i] = exp(log_d_cum[b,t,h] - log_d_cum[b,i,h])  for i<=t
-        //  4. outer[b,t,h,dk,dv] = (dt*B scaled k_t) ⊗ v_t
-        //  5. y[b,t,h,dv]       = q[b,t,h,dk] @ Σ_i W[b,h,t,i] * outer[b,i,h,dk,dv]
+        // For t=1 (decode) this is one step; for t>1 (prefill) we run the loop
+        // in Rust (dispatches t*n_layers Metal kernels but is numerically exact).
+        let mut outputs = Vec::with_capacity(t);
 
-        // Compute log-decay: [b, t, n_heads]
-        let log_d = a.unsqueeze(0)?.broadcast_mul(&dt)?.neg()?; // [b, t, n_h]
-                                                                // Cumulative sum: [b, t, n_heads]
-        let log_d_cum = log_d.cumsum(1)?; // [b, t, n_h]
+        for ti in 0..t {
+            // Extract per-timestep slices: [b, n_heads, head_dim]
+            let g_t = g.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads]
+            let beta_t = beta.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads]
+            let q_t = q_f32.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads, head_k_dim]
+            let k_t = k_f32.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads, head_k_dim]
+            let v_t = v_f32.narrow(1, ti, 1)?.squeeze(1)?; // [b, n_heads, head_v_dim]
 
-        // Build the causal weight matrix W[b, n_h, t, t]:
-        //   W[b, h, t_out, t_in] = exp(log_d_cum[b, t_out, h] - log_d_cum[b, t_in, h])  for t_in <= t_out
-        // Rearrange log_d_cum to [b, t, 1, n_h] vs [b, 1, t, n_h]:
-        //   diff[b, t_out, t_in, n_h] = log_d_cum[b, t_out, n_h] - log_d_cum[b, t_in, n_h]
-        // Then apply lower-triangular mask and exp.
-        let ldc = log_d_cum.contiguous()?; // [b, t, n_h]
-        let ldc_row = ldc.unsqueeze(2)?; // [b, t, 1, n_h]  (query positions)
-        let ldc_col = ldc.unsqueeze(1)?; // [b, 1, t, n_h]  (key positions)
-        let diff = ldc_row.broadcast_sub(&ldc_col)?; // [b, t, t, n_h]  (t_out, t_in)
-                                                     // Apply causal mask: set upper-triangular (t_in > t_out) to -inf
-        let causal_w = {
-            let diff_c = diff.contiguous()?;
-            // Build mask: 1.0 for i<=j, -inf for i>j  (lower triangular)
-            let mask_vals: Vec<f32> = (0..t)
-                .flat_map(|row| {
-                    (0..t).map(move |col| {
-                        if col <= row {
-                            0.0f32
-                        } else {
-                            f32::NEG_INFINITY
-                        }
-                    })
-                })
-                .collect();
-            let mask = Tensor::new(mask_vals.as_slice(), &device)?
-                .reshape((t, t))?
-                .to_dtype(dtype)?
-                .unsqueeze(0)?
-                .unsqueeze(3)?; // [1, t, t, 1]
-            diff_c.broadcast_add(&mask)?.exp()? // [b, t, t, n_h]
-        };
-        // causal_w: [b, t_out, t_in, n_h]  →  transpose to [b, n_h, t_out, t_in]
-        let causal_w = causal_w.permute((0, 3, 1, 2))?.contiguous()?; // [b, n_h, t, t]
+            // Decay: state [b, n_heads, hk, hv] *= g_t [b, n_heads] (broadcast)
+            state = state.broadcast_mul(&g_t.unsqueeze(2)?.unsqueeze(3)?)?;
 
-        // Compute outer products for all tokens: outer[b, t, n_h, dk, dv]
-        // dt_b = dt * b_input: [b, t, n_h]
-        let dt_b = (dt * b_input)?; // [b, t, n_h]
-                                    // k_scaled = k * dt_b: [b, t, n_h, dk]
-        let k_scaled = k.broadcast_mul(&dt_b.unsqueeze(3)?)?; // [b, t, n_h, dk]
+            // Read: kv_mem[b, n_heads, head_v_dim] = sum_over_hk( state * k_t[:,:,None,:] )
+            // k_t: [b, n_h, hk]  →  [b, n_h, hk, 1]
+            // state: [b, n_h, hk, hv]
+            // (state * k_t[...,None]).sum(-2): [b, n_h, hv]
+            let kv_mem = (state.broadcast_mul(&k_t.unsqueeze(3)?)?).sum(candle_core::D::Minus2)?; // [b, n_heads, head_v_dim]
 
-        // outer = k_scaled[:,:,:,:,None] * v[:,:,:,None,:]
-        //       → [b, t, n_h, dk, dv]
-        // Via einsum-style: reshape and batched matmul
-        // k_scaled: [b, t, n_h, dk, 1]  ×  v: [b, t, n_h, 1, dv]
-        let k_col = k_scaled.unsqueeze(4)?.contiguous()?; // [b, t, n_h, dk, 1]
-        let v_row = v.unsqueeze(3)?.contiguous()?; // [b, t, n_h, 1, dv]
-        let outer = k_col.matmul(&v_row)?; // [b, t, n_h, dk, dv]
+            // Delta: delta[b, n_h, hv] = (v_t - kv_mem) * beta_t
+            // Use broadcast_mul since beta_t is [b, n_h] and diff is [b, n_h, hv]
+            let diff = (v_t - kv_mem)?;
+            let delta = diff.broadcast_mul(&beta_t.unsqueeze(2)?)?; // [b, n_h, hv]
 
-        // Now compute: weighted_outer[b, n_h, t_out, dk, dv]
-        //   = Σ_{t_in} causal_w[b, n_h, t_out, t_in] * outer[b, t_in, n_h, dk, dv]
-        //
-        // Rearrange outer to [b, n_h, t, dk, dv]
-        let outer_t = outer.permute((0, 2, 1, 3, 4))?.contiguous()?; // [b, n_h, t, dk, dv]
+            // Write: state += k_t[:,:,:,None] * delta[:,:,None,:]  (outer product)
+            state = (state + k_t.unsqueeze(3)?.broadcast_mul(&delta.unsqueeze(2)?)?)?;
 
-        // Reshape for batched matmul:
-        //   causal_w: [b, n_h, t, t]
-        //   outer_t:  [b, n_h, t, dk*dv]
-        let dk_dv = self.head_dim * self.head_dim;
-        let outer_flat = outer_t.reshape((b, self.n_heads, t, dk_dv))?; // [b, n_h, t, dk*dv]
-                                                                        // weighted = causal_w @ outer_flat: [b, n_h, t_out, dk*dv]
-        let weighted = causal_w.contiguous()?.matmul(&outer_flat.contiguous()?)?;
-        // Reshape back: [b, n_h, t, dk, dv]
-        let weighted = weighted.reshape((b, self.n_heads, t, self.head_dim, self.head_dim))?;
+            // Read output: out_t[b, n_h, hv] = sum_over_hk( state * q_t[:,:,:,None] )
+            let out_t = (state.broadcast_mul(&q_t.unsqueeze(3)?)?).sum(candle_core::D::Minus2)?; // [b, n_h, hv]
 
-        // Account for initial state contribution:
-        //   state_contrib[b, n_h, t, dk, dv] = exp(log_d_cum[b, t, n_h]) * state_0[b, n_h, dk, dv]
-        let init_decay = log_d_cum.exp()?.permute((0, 2, 1))?.contiguous()?; // [b, n_h, t]
-        let init_contrib = state
-            .unsqueeze(2)?
-            .broadcast_mul(&init_decay.unsqueeze(3)?.unsqueeze(4)?)?;
-        // [b, n_h, t, dk, dv]
+            outputs.push(out_t.unsqueeze(1)?); // [b, 1, n_h, hv]
+        }
 
-        let full_state = (weighted + init_contrib)?; // [b, n_h, t, dk, dv]
+        // Save state for next call (detach to avoid accumulating graph)
+        self.recurrent_state = Some(state.detach());
 
-        // Update the persistent state with the final step's state:
-        //   state[T] = full_state[:, :, T-1, :, :]
-        state = full_state
-            .narrow(2, t - 1, 1)?
-            .squeeze(2)?
+        // Stack outputs: [b, t, n_heads, head_v_dim]  (all F32)
+        let out_raw = Tensor::cat(&outputs, 1)?; // [b, t, n_heads, head_v_dim]
+
+        // ── Gated RMSNorm: norm(out) * silu(z) ───────────────────────────────
+        // Reshape for norm: [b*t*n_heads, head_v_dim]
+        let out_flat = out_raw
             .contiguous()?
-            .detach(); // [b, n_h, dk, dv]
+            .reshape((b * t * self.n_heads, self.head_v_dim))?; // F32
 
-        // Compute output: y[b, t, n_h, dv] = q[b, t, n_h, dk] @ full_state[b, n_h, t, dk, dv]
-        // Rearrange q to [b, n_h, t, dk] then [b, n_h, t, 1, dk]
-        let q_perm = q.permute((0, 2, 1, 3))?.contiguous()?; // [b, n_h, t, dk]
-        let q_4 = q_perm.unsqueeze(3)?.contiguous()?; // [b, n_h, t, 1, dk]
-                                                      // full_state: [b, n_h, t, dk, dv]
-        let out_raw = q_4.matmul(&full_state.contiguous()?)?.squeeze(3)?; // [b, n_h, t, dv]
+        // RMSNorm over head_v_dim
+        let out_normed = rms_norm_tensor(&out_flat, &self.norm_weight, 1e-6)?; // F32
 
-        // Apply output norm per token per head: rms_norm over dv dimension
-        let out_normed = rms_norm_tensor(&out_raw, &self.norm_weight, 1e-6)?; // [b, n_h, t, dv]
+        // z gate: [b, t, value_dim] -> [b*t*n_heads, head_v_dim], then silu
+        // z is in model dtype; cast to F32 for the gate multiply
+        let z_f32 = z.to_dtype(DType::F32)?;
+        let z_flat = z_f32
+            .contiguous()?
+            .reshape((b * t * self.n_heads, self.head_v_dim))?;
+        let z_gate = z_flat.silu()?; // F32
 
-        // Rearrange to [b, t, n_h*dv]
-        let y = out_normed.permute((0, 2, 1, 3))?.contiguous()?.reshape((
-            b,
-            t,
-            self.n_heads * self.head_dim,
-        ))?;
+        // Gated output: [b*t*n_heads, head_v_dim]  F32
+        let out_gated = (out_normed * z_gate)?;
 
-        self.ssm_state = Some(state);
+        // Reshape back: [b, t, value_dim] and cast to model dtype
+        let out = out_gated.reshape((b, t, self.value_dim))?.to_dtype(dtype)?;
 
-        // Gate with z: silu(z) * cat(y, y) or similar
-        // Looking at the architecture: out_proj takes [2*hidden] input.
-        // z is [b, t, 2*hidden], y is [b, t, inner_dim=n_heads*head_dim]
-        // We need to combine y with z to get 2*hidden for out_proj.
-        // The standard Mamba2 gate: y_gated = y * silu(z[:, :, :inner]) then pad,
-        // but here inner_dim (2048) == hidden (1024) * 2, so z splits into two halves:
-        // gate1 [b,t,hidden] and gate2 [b,t,hidden], y [b,t,2048=2*hidden]
-        // Most likely: gated_output = y * silu(z)  where both are [b,t,2*hidden]
-        let z_gated = z.silu()?;
-        let out = (y * z_gated)?; // [b, t, 2*hidden]
-
-        let out = self.out_proj.forward(&out)?; // [b, t, hidden]
-        Ok(out)
+        // ── Output projection: value_dim -> hidden ────────────────────────────
+        self.out_proj.forward(&out).map_err(Into::into)
     }
 
-    /// Apply depthwise conv1d with causal padding.
+    /// Apply depthwise causal conv1d with SiLU activation.
+    ///
+    /// Mirrors the PyTorch reference:
+    ///   `F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])`
+    ///
     /// x: [b, t, channels]
     /// weight stored as [channels, 1, kernel] (depthwise)
-    fn apply_conv1d(&mut self, x: &Tensor) -> Result<Tensor> {
+    /// Returns: [b, t, channels]  (after SiLU)
+    fn apply_conv1d_silu(&mut self, x: &Tensor) -> Result<Tensor> {
         let (b, _t, c) = x.dims3()?;
         let kernel = self.conv1d_weight.dim(2)?;
         let dtype = x.dtype();
@@ -798,10 +797,11 @@ impl LinearAttn {
         // Depthwise conv1d: groups = c, no padding (we already padded manually), stride=1
         let out = inp.conv1d(&w, 0, 1, 1, c)?; // [b, c, t]
 
-        // Transpose back: [b, c, t] -> [b, t, c], restore original dtype
+        // Transpose back: [b, c, t] -> [b, t, c], restore original dtype, then SiLU
         out.transpose(1, 2)?
             .contiguous()?
-            .to_dtype(dtype)
+            .to_dtype(dtype)?
+            .silu()
             .map_err(Into::into)
     }
 }
@@ -1026,6 +1026,7 @@ impl Qwen35Model {
         // Both operands must be contiguous for Metal matmul.
         let last_2d = last.squeeze(1)?.contiguous()?; // [b, hidden]
         let logits = last_2d.matmul(&self.lm_head_weight.t()?.contiguous()?)?; // [b, vocab]
+
         let logits = logits.unsqueeze(1)?; // [b, 1, vocab]
         Ok(logits)
     }
