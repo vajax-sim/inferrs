@@ -49,7 +49,7 @@ fn spawn_server(model_id: &str, port: u16) -> Child {
             "--host",
             "127.0.0.1",
             "--max-tokens",
-            "64",
+            "128",
             "--dtype",
             "bf16",
             "--device",
@@ -87,6 +87,56 @@ fn looks_intelligible(text: &str) -> bool {
     text.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Starts `inferrs serve <model_id>` with TurboQuant KV-cache compression enabled.
+///
+/// Passes `--turbo-quant=<bits>` to enable the TurboQuant quantized KV cache
+/// instead of the default full-precision cache.  Uses `require_equals` syntax
+/// as defined in the CLI (`--turbo-quant=4` for 4-bit).
+fn spawn_server_turbo(model_id: &str, port: u16, bits: u8) -> Child {
+    let bin = env!("CARGO_BIN_EXE_inferrs");
+    let turbo_flag = format!("--turbo-quant={}", bits);
+    Command::new(bin)
+        .args([
+            "serve",
+            model_id,
+            "--port",
+            &port.to_string(),
+            "--host",
+            "127.0.0.1",
+            "--max-tokens",
+            "128",
+            "--dtype",
+            "bf16",
+            "--device",
+            "auto",
+            &turbo_flag,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn inferrs with TurboQuant")
+}
+
+/// Send a single chat-completion request and return the assistant's text.
+///
+/// Uses 128 max_tokens to allow Qwen3's `<think>…</think>` preamble to
+/// complete before the model outputs the actual reply.
+fn chat_completion(port: u16, user_message: &str) -> String {
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+    let body = serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": user_message}],
+        "max_tokens": 128,
+        "temperature": 0.0
+    });
+    let resp: serde_json::Value = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(&body)
+        .expect("chat completion request failed")
+        .into_json()
+        .expect("failed to parse chat completion response");
+    resp["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}

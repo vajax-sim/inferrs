@@ -108,9 +108,11 @@ pub struct ServeArgs {
     pub paged_attention: Option<f64>,
 
     /// Enable TurboQuant KV cache compression.
-    /// Use as a flag (`--turbo-quant`) for the default 4-bit compression, or with an explicit
-    /// bit-width (`--turbo-quant=2`) for 1–8 bits.  Reduces KV cache memory by (dtype_bits/bits)×.
-    #[arg(long, num_args(0..=1), default_missing_value("4"), require_equals(true))]
+    /// Use as a flag (`--turbo-quant`) for the default 5-bit compression, or with an explicit
+    /// bit-width (`--turbo-quant=4`) for 1–8 bits.  Reduces KV cache memory by (dtype_bits/bits)×.
+    /// 5-bit (the default) gives 3.2× compression vs bf16 with near-lossless quality.
+    /// 4-bit gives 4× compression but may degrade quality for small models (< 8B parameters).
+    #[arg(long, num_args(0..=1), default_missing_value("5"), require_equals(true))]
     pub turbo_quant: Option<u8>,
 }
 
