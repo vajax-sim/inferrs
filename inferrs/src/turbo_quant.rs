@@ -190,6 +190,14 @@ fn dequantize_into(
 /// Stores nibble-packed indices and per-vector absmax scales independently
 /// per head, so prefill and decode appends compose correctly.
 ///
+/// ## Prefill bypass
+///
+/// During prefill (multi-token appends) the K/V tensors are stored unquantized
+/// on-device in `prefill_kv`.  On the first decode call (`append` with a single
+/// token) the entire prefill batch is compressed in one shot — one GPU→CPU
+/// transfer for all prefill tokens — and `prefill_kv` is cleared.  This
+/// restores prefill throughput to the same level as the unquantized path.
+///
 /// ## Incremental dequantize
 ///
 /// After a `dequantize()` call the resulting `[1, num_kv_heads, seq_len, head_dim]`
@@ -207,7 +215,7 @@ pub struct TurboQuantKvCache {
     k_scales: Vec<Vec<f32>>,
     v_packed: Vec<Vec<u8>>,
     v_scales: Vec<Vec<f32>>,
-    /// Number of tokens cached so far.
+    /// Number of tokens cached so far (quantized tokens only).
     pub seq_len: usize,
     /// Number of tokens already reflected in `kv_cache` (i.e. already uploaded).
     /// When `cached_seq_len == seq_len` after an append, only the delta needs
@@ -216,6 +224,10 @@ pub struct TurboQuantKvCache {
     /// On-device KV tensors covering the first `cached_seq_len` tokens.
     /// Shape: `[1, num_kv_heads, cached_seq_len, head_dim]`.
     kv_cache: Option<(Tensor, Tensor)>,
+    /// Unquantized on-device KV tensors accumulated during prefill.
+    /// Cleared (and flushed into the quantized store) on the first decode call.
+    /// Shape when set: `[1, num_kv_heads, prefill_len, head_dim]`.
+    prefill_kv: Option<(Tensor, Tensor)>,
 }
 
 impl TurboQuantKvCache {
@@ -233,22 +245,19 @@ impl TurboQuantKvCache {
             seq_len: 0,
             cached_seq_len: 0,
             kv_cache: None,
+            prefill_kv: None,
         }
     }
 
-    /// Append newly computed key and value tensors to the cache.
-    ///
-    /// `k` and `v`: shape `[1, num_kv_heads, new_seq_len, head_dim]`
-    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+    /// Compress a pair of on-device tensors `[1, num_kv_heads, t, head_dim]`
+    /// into the packed quantized store.  Used both by `append` (decode path)
+    /// and by the prefill-flush in `dequantize`.
+    fn compress_tensors(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         let new_seq = k.dim(2)?;
         let head_dim = self.head_dim;
 
-        if !head_dim.is_multiple_of(GROUP_SIZE) {
-            anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
-        }
-
-        // Single device→CPU transfer for all heads at once instead of one per head.
-        // k layout after squeeze(0)+contiguous: [num_kv_heads, new_seq, head_dim] (row-major).
+        // Single device→CPU transfer for all heads at once.
+        // Layout: [num_kv_heads, new_seq, head_dim] (row-major after contiguous).
         let k_all: Vec<f32> = k
             .squeeze(0)?
             .to_dtype(DType::F32)?
@@ -264,8 +273,7 @@ impl TurboQuantKvCache {
             .flatten_all()?
             .to_vec1()?;
 
-        // Quantize each head from its slice of the flat CPU buffer.
-        let stride = new_seq * head_dim; // elements per head in the flat buffer
+        let stride = new_seq * head_dim;
         for h in 0..self.num_kv_heads {
             let k_slice = &k_all[h * stride..(h + 1) * stride];
             let v_slice = &v_all[h * stride..(h + 1) * stride];
@@ -283,13 +291,56 @@ impl TurboQuantKvCache {
         Ok(())
     }
 
-    /// Return dequantized `(k, v)` tensors of shape `[1, num_kv_heads, seq_len, head_dim]`.
+    /// Append newly computed key and value tensors to the cache.
     ///
-    /// Uses an incremental strategy: only tokens beyond `cached_seq_len` are
-    /// dequantized; the result is concatenated onto the cached on-device tensor
-    /// and the cache is updated.  This reduces dequantize work from
-    /// O(seq_len) to O(new_tokens) on every decode step after the first prefill.
+    /// `k` and `v`: shape `[1, num_kv_heads, new_seq_len, head_dim]`
+    ///
+    /// **Prefill bypass**: if `new_seq_len > 1` the tensors are stored
+    /// unquantized on-device (no GPU→CPU transfer) and compressed in one
+    /// batch on the first decode call, eliminating the per-layer transfer
+    /// overhead during prefill.
+    pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let new_seq = k.dim(2)?;
+        let head_dim = self.head_dim;
+
+        if !head_dim.is_multiple_of(GROUP_SIZE) {
+            anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
+        }
+
+        if new_seq > 1 {
+            // Prefill path: store unquantized on-device; defer compression.
+            let prefill_kv = match self.prefill_kv.take() {
+                None => (k.clone(), v.clone()),
+                Some((k_prev, v_prev)) => {
+                    let k_cat = Tensor::cat(&[&k_prev, k], 2)?;
+                    let v_cat = Tensor::cat(&[&v_prev, v], 2)?;
+                    (k_cat, v_cat)
+                }
+            };
+            self.prefill_kv = Some(prefill_kv);
+        } else {
+            // Decode path: if there are uncompressed prefill tokens, flush them first.
+            if let Some((pk, pv)) = self.prefill_kv.take() {
+                self.compress_tensors(&pk, &pv)?;
+            }
+            self.compress_tensors(k, v)?;
+        }
+
+        Ok(())
+    }
+
+    /// Return `(k, v)` tensors of shape `[1, num_kv_heads, total_seq_len, head_dim]`.
+    ///
+    /// During prefill the unquantized on-device tensors are returned directly
+    /// (no CPU round-trip).  During decode the incremental dequantize strategy
+    /// is used: only the delta tokens since the last call are decompressed and
+    /// concatenated onto the cached device tensor.
     pub fn dequantize(&mut self) -> Result<(Tensor, Tensor)> {
+        // Prefill path: return the unquantized tensors directly.
+        if let Some((k, v)) = &self.prefill_kv {
+            return Ok((k.clone(), v.clone()));
+        }
+
         if self.seq_len == 0 {
             anyhow::bail!("dequantize called on empty TurboQuantKvCache");
         }
@@ -393,6 +444,7 @@ impl TurboQuantKvCache {
         self.seq_len = 0;
         self.cached_seq_len = 0;
         self.kv_cache = None;
+        self.prefill_kv = None;
     }
 }
 
