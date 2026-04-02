@@ -1469,7 +1469,18 @@ impl Gemma4Model {
         seqlen_offset: usize,
         is_sliding: bool,
     ) -> Result<Tensor> {
-        let kv_len = tgt_len + seqlen_offset;
+        // For sliding-window layers the rotating KV cache holds at most
+        // `sliding_window` tokens.  Clamp kv_len so the mask's last dimension
+        // matches the actual KV tensor returned by `RetainingRotatingKvCache::append`.
+        // Without this, a prefill prompt longer than `sliding_window` tokens would
+        // produce attn_weights of shape [..., tgt_len, sliding_window] but a mask of
+        // shape [..., tgt_len, tgt_len], causing a broadcast/dimension panic.
+        let unclamped_kv_len = tgt_len + seqlen_offset;
+        let kv_len = if is_sliding {
+            unclamped_kv_len.min(self.sliding_window)
+        } else {
+            unclamped_kv_len
+        };
         let key = (tgt_len, kv_len, seqlen_offset, is_sliding);
 
         if let Some(cached) = self.mask_cache.get(&key) {
@@ -1484,24 +1495,54 @@ impl Gemma4Model {
         } else {
             usize::MAX
         };
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| {
-                (0..tgt_len).map(move |j| {
-                    if i < j || (window != usize::MAX && j + window < i) {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.0
-                    }
+
+        // Build the mask over the visible KV context.
+        //
+        // For global layers: kv_len == tgt_len + seqlen_offset, so we first
+        // build a [tgt_len, tgt_len] causal square and then prepend seqlen_offset
+        // zero-columns for the cached prefix (all visible, no masking needed).
+        //
+        // For sliding layers: kv_len is clamped to sliding_window.  The oldest
+        // tokens have already been evicted from the rotating cache, so they are
+        // simply absent — no prefix columns are needed.  We build a
+        // [tgt_len, min(tgt_len, kv_len)] window where each query position i
+        // can attend to KV positions within the sliding window.
+        let mask = if is_sliding {
+            // Number of KV slots from the current prefill chunk that are visible.
+            let mask: Vec<f32> = (0..tgt_len)
+                .flat_map(|i| {
+                    // For each query row, the KV columns run over the last `kv_len`
+                    // positions of the sequence.  Column j in the clamped mask
+                    // corresponds to absolute position (unclamped_kv_len - kv_len + j).
+                    let kv_start_abs = unclamped_kv_len - kv_len; // oldest visible KV position
+                    (0..kv_len).map(move |j| {
+                        let abs_j = kv_start_abs + j; // absolute position of this KV slot
+                        let abs_i = seqlen_offset + i; // absolute position of this query
+                        if abs_j > abs_i || (window != usize::MAX && abs_j + window < abs_i) {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        }
+                    })
                 })
-            })
-            .collect();
-        let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
-        let mask = if seqlen_offset > 0 {
-            let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, &self.device)?;
-            Tensor::cat(&[&mask0, &mask], D::Minus1)?
+                .collect();
+            Tensor::from_slice(&mask, (tgt_len, kv_len), &self.device)?
         } else {
-            mask
+            // Global (full) attention: standard causal mask + cached-prefix columns.
+            let mask: Vec<f32> = (0..tgt_len)
+                .flat_map(|i| {
+                    (0..tgt_len).map(move |j| if i < j { f32::NEG_INFINITY } else { 0.0 })
+                })
+                .collect();
+            let mask = Tensor::from_slice(&mask, (tgt_len, tgt_len), &self.device)?;
+            if seqlen_offset > 0 {
+                let mask0 = Tensor::zeros((tgt_len, seqlen_offset), DType::F32, &self.device)?;
+                Tensor::cat(&[&mask0, &mask], D::Minus1)?
+            } else {
+                mask
+            }
         };
+
         // Cache as [1, 1, tgt_len, kv_len] so the b_size expand is cheap.
         let mask_1 = mask.unsqueeze(0)?.unsqueeze(0)?;
         self.mask_cache.insert(key, mask_1.clone());
