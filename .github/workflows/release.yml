@@ -262,7 +262,7 @@ jobs:
                 libinferrs_backend_rocm.so
                 libinferrs_backend_vulkan.so
               ].each do |plugin|
-                (lib / "inferrs" / plugin).install plugin if File.exist?(plugin)
+                (lib / "inferrs").install plugin if File.exist?(plugin)
               end
             end
 
