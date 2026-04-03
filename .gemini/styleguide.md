@@ -48,29 +48,6 @@ When building engineering plans from requirements:
 3. Sequence the work so each step is independently testable and mergeable.
 4. Call out risks, unknowns, and decisions that need stakeholder input.
 
-## Output format
-
-Use this exact structure. Omit empty sections. Keep it concise — density over length.
-
-```
-## Review: <title>
-
-### Summary
-<1-3 sentences: what this changes and your overall assessment>
-
-### Critical
-- <issue with file:line reference and suggested fix>
-
-### Warnings
-- <issue with file:line reference>
-
-### Suggestions
-- <improvement idea>
-
-### What looks good
-- <positive observations>
-```
-
 ## Principles
 
 - Don't nitpick style unless it harms readability. Trust the project's existing
