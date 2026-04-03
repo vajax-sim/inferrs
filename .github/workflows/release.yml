@@ -454,13 +454,15 @@ jobs:
             "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/ref/heads/master" \
             | jq -r '.object.sha')
 
-          # 422 means branch already exists; that is fine
-          curl -sf -X POST \
+          # 201 = created, 422 = branch already exists — both are acceptable
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg ref "refs/heads/${BRANCH}" --arg sha "$FORK_SHA" \
                  '{ref: $ref, sha: $sha}')" \
-            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/refs" || true
+            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/refs")
+          [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "422" ]] || \
+            { echo "Branch creation failed with HTTP ${HTTP_STATUS}"; exit 1; }
 
           # ── push manifest files to the fork branch ────────────────────────
           for FILE in \
@@ -492,8 +494,8 @@ jobs:
           done
 
           # ── open PR from fork branch → microsoft/winget-pkgs ─────────────
-          # 422 means a PR already exists for this branch; that is fine
-          curl -sf -X POST \
+          # 201 = created, 422 = PR already exists — both are acceptable
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
@@ -502,4 +504,6 @@ jobs:
               --arg head "${PUBLISHER}:${BRANCH}" \
               --arg base "master" \
               '{title: $title, body: $body, head: $head, base: $base}')" \
-            "https://api.github.com/repos/microsoft/winget-pkgs/pulls" || true
+            "https://api.github.com/repos/microsoft/winget-pkgs/pulls")
+          [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "422" ]] || \
+            { echo "PR creation failed with HTTP ${HTTP_STATUS}"; exit 1; }
