@@ -454,12 +454,15 @@ jobs:
             "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/ref/heads/master" \
             | jq -r '.object.sha')
 
-          curl -sf -X POST \
+          # 201 = created, 422 = branch already exists — both are acceptable
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n --arg ref "refs/heads/${BRANCH}" --arg sha "$FORK_SHA" \
                  '{ref: $ref, sha: $sha}')" \
-            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/refs"
+            "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/git/refs")
+          [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "422" ]] || \
+            { echo "Branch creation failed with HTTP ${HTTP_STATUS}"; exit 1; }
 
           # ── push manifest files to the fork branch ────────────────────────
           for FILE in \
@@ -469,11 +472,19 @@ jobs:
 
             CONTENT=$(base64 -w0 "manifests/${FILE}")
 
+            # Fetch existing file SHA in case the file already exists on the branch
+            FILE_SHA=$(curl -sf \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${PUBLISHER}/winget-pkgs/contents/${DEST_DIR}/${FILE}?ref=${BRANCH}" \
+              | jq -r '.sha // empty' || true)
+
             PAYLOAD=$(jq -n \
               --arg message "Add inferrs ${VERSION}" \
               --arg content "$CONTENT" \
               --arg branch "$BRANCH" \
-              '{message: $message, content: $content, branch: $branch}')
+              --arg sha "$FILE_SHA" \
+              'if $sha != "" then {message: $message, content: $content, branch: $branch, sha: $sha}
+               else {message: $message, content: $content, branch: $branch} end')
 
             curl -sf -X PUT \
               -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -483,7 +494,8 @@ jobs:
           done
 
           # ── open PR from fork branch → microsoft/winget-pkgs ─────────────
-          curl -sf -X POST \
+          # 201 = created, 422 = PR already exists — both are acceptable
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "$(jq -n \
@@ -492,4 +504,6 @@ jobs:
               --arg head "${PUBLISHER}:${BRANCH}" \
               --arg base "master" \
               '{title: $title, body: $body, head: $head, base: $base}')" \
-            "https://api.github.com/repos/microsoft/winget-pkgs/pulls"
+            "https://api.github.com/repos/microsoft/winget-pkgs/pulls")
+          [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "422" ]] || \
+            { echo "PR creation failed with HTTP ${HTTP_STATUS}"; exit 1; }
