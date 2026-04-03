@@ -25,7 +25,7 @@ use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{rms_norm, Activation, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
-use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
+use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache, MIN_KV_BUFFER_CAP};
 
 // ---------------------------------------------------------------------------
 // QLinear: a Linear layer backed by either a standard Tensor or a QMatMul.
@@ -740,7 +740,10 @@ impl RetainingKvCache {
         // Starting from 0, the first allocation sizes to max(needed, 256) so a
         // single short conversation never allocates more than 256 tokens' worth.
         if needed > self.buf_cap {
-            let new_cap = needed.next_power_of_two().max(256).min(self.max_seq_len);
+            let new_cap = needed
+                .next_power_of_two()
+                .max(MIN_KV_BUFFER_CAP)
+                .min(self.max_seq_len);
 
             let mut k_shape = k.dims().to_vec();
             k_shape[2] = new_cap;

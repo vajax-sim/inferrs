@@ -107,6 +107,9 @@ pub struct RawConfig {
     pub text_config: Option<TextConfig>,
 }
 
+/// Default epsilon for RMS normalization layers across all model families.
+const RMS_NORM_EPS_DEFAULT: f64 = 1e-6;
+
 impl RawConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path).context("Failed to read config.json")?;
@@ -171,7 +174,7 @@ impl RawConfig {
             max_window_layers: self.max_window_layers.unwrap_or(28),
             tie_word_embeddings: self.tie_word_embeddings.unwrap_or(true),
             rope_theta: self.rope_theta.unwrap_or(1000000.0),
-            rms_norm_eps: self.rms_norm_eps.unwrap_or(1e-6),
+            rms_norm_eps: self.rms_norm_eps.unwrap_or(RMS_NORM_EPS_DEFAULT),
             use_sliding_window: self.use_sliding_window.unwrap_or(false),
             hidden_act: candle_nn::Activation::Silu,
         }
@@ -193,7 +196,7 @@ impl RawConfig {
                     .as_deref()
                     .unwrap_or("gelu_pytorch_tanh"),
             ),
-            rms_norm_eps: self.rms_norm_eps.unwrap_or(1e-6),
+            rms_norm_eps: self.rms_norm_eps.unwrap_or(RMS_NORM_EPS_DEFAULT),
             rope_theta: self.rope_theta.unwrap_or(10000.0),
             attention_bias: self.attention_bias.unwrap_or(false),
             final_logit_softcapping: self.final_logit_softcapping,
@@ -220,7 +223,7 @@ impl RawConfig {
                     .as_deref()
                     .unwrap_or("gelu_pytorch_tanh"),
             ),
-            rms_norm_eps: self.rms_norm_eps.unwrap_or(1e-6),
+            rms_norm_eps: self.rms_norm_eps.unwrap_or(RMS_NORM_EPS_DEFAULT),
             rope_theta: self.rope_theta.unwrap_or(10000.0),
             attention_bias: self.attention_bias.unwrap_or(false),
             final_logit_softcapping: self.final_logit_softcapping,
@@ -251,7 +254,7 @@ impl RawConfig {
         let num_attention_heads = self.num_attention_heads.unwrap_or(16);
         let num_key_value_heads = self.num_key_value_heads.unwrap_or(8);
         let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
-        let rms_norm_eps = self.rms_norm_eps.unwrap_or(1e-6);
+        let rms_norm_eps = self.rms_norm_eps.unwrap_or(RMS_NORM_EPS_DEFAULT);
         let tie_word_embeddings = self.tie_word_embeddings.unwrap_or(true);
         let rope_theta = self.rope_theta.unwrap_or(1_000_000.0);
 
@@ -297,7 +300,9 @@ impl RawConfig {
         let hidden_size_per_layer_input = tc
             .and_then(|t| t.hidden_size_per_layer_input)
             .unwrap_or(256);
-        let rms_norm_eps = tc.and_then(|t| t.rms_norm_eps).unwrap_or(1e-6);
+        let rms_norm_eps = tc
+            .and_then(|t| t.rms_norm_eps)
+            .unwrap_or(RMS_NORM_EPS_DEFAULT);
         let sliding_window = tc.and_then(|t| t.sliding_window).unwrap_or(512);
         let sliding_window_pattern = tc.and_then(|t| t.sliding_window_pattern).unwrap_or(5);
         let max_position_embeddings = tc.and_then(|t| t.max_position_embeddings).unwrap_or(131072);
@@ -393,7 +398,9 @@ impl RawConfig {
         let num_attention_heads = tc.and_then(|t| t.num_attention_heads).unwrap_or(8);
         let num_key_value_heads = tc.and_then(|t| t.num_key_value_heads).unwrap_or(2);
         let head_dim = tc.and_then(|t| t.head_dim).unwrap_or(256);
-        let rms_norm_eps = tc.and_then(|t| t.rms_norm_eps).unwrap_or(1e-6);
+        let rms_norm_eps = tc
+            .and_then(|t| t.rms_norm_eps)
+            .unwrap_or(RMS_NORM_EPS_DEFAULT);
         let tie_word_embeddings = tc.and_then(|t| t.tie_word_embeddings).unwrap_or(true);
         let full_attention_interval = tc.and_then(|t| t.full_attention_interval).unwrap_or(4);
         let linear_conv_kernel_dim = tc.and_then(|t| t.linear_conv_kernel_dim).unwrap_or(4);

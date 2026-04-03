@@ -159,7 +159,12 @@ pub struct TurboQuantConfig {
 // At head_dim=128, GROUP_SIZE=32: 4 f32 scales = 16 bytes/token vs 4 bytes
 // for per-vector. The packed indices are unchanged.
 
-const GROUP_SIZE: usize = 32;
+pub const GROUP_SIZE: usize = 32;
+
+/// Minimum pre-allocated capacity (in tokens) for growing KV cache buffers.
+/// Used by both `TurboQuantKvCache` and `RetainingKvCache` / `RetainingRotatingKvCache`
+/// to avoid excessive reallocations on short sequences.
+pub const MIN_KV_BUFFER_CAP: usize = 256;
 
 /// Quantize a flat CPU f32 slice `data` representing `[seq_len, head_dim]`
 /// using per-group absmax.  Used by `append` to avoid constructing per-head
@@ -642,7 +647,9 @@ impl TurboQuantKvCache {
         // On the first decode step this allocates a buffer sized to at least `seq_len` tokens.
         let needed_cap = self.seq_len;
         if self.kv_buffer_cap < needed_cap {
-            let new_cap = needed_cap.max(self.kv_buffer_cap * 2).max(256);
+            let new_cap = needed_cap
+                .max(self.kv_buffer_cap * 2)
+                .max(MIN_KV_BUFFER_CAP);
             let k_buf = Tensor::zeros(
                 (1, self.num_kv_heads, new_cap, self.head_dim),
                 self.orig_dtype,

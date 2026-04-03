@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{linear_no_bias, ops, Linear, RmsNorm, VarBuilder};
+use candle_nn::{linear_no_bias, ops, rotary_emb, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 
@@ -106,6 +106,61 @@ impl Mlp {
         let hidden = (gate * up)?;
         self.down_proj.forward(&hidden).map_err(Into::into)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared RoPE application
+// ---------------------------------------------------------------------------
+
+/// Apply rotary embedding to a query or key tensor.
+///
+/// `x`       : `[batch, n_heads, seq_len, head_dim]`
+/// `cos`/`sin`: `[max_seq_len, rot_half]` — `rot_half = rot_dim / 2`
+///
+/// Both this implementation and candle's `rotary_emb::rope` use the **split**
+/// layout: the first half of the head dim is `x1`, the second half is `x2`,
+/// and the rotation is `[x1*cos - x2*sin, x1*sin + x2*cos]`.  This is
+/// identical to candle's `rotate_half` convention.
+///
+/// When `rot_dim == head_dim` (full rotation, e.g. Qwen3) the fast fused
+/// kernel (`rotary_emb::rope`) is used.  When `rot_dim < head_dim` (partial
+/// rotation, e.g. Qwen3.5) the manual path handles the pass-through suffix.
+pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let (_b, _h, t, d) = x.dims4()?;
+    let rot_half = cos.dim(1)?;
+    let rot_dim = rot_half * 2;
+
+    if rot_dim > d {
+        anyhow::bail!("rot_dim {rot_dim} > head_dim {d}");
+    }
+
+    // Fast path: full rotation — delegate to the fused candle kernel.
+    if rot_dim == d {
+        let cos = cos.narrow(0, 0, t)?.contiguous()?;
+        let sin = sin.narrow(0, 0, t)?.contiguous()?;
+        return rotary_emb::rope(&x.contiguous()?, &cos, &sin).map_err(Into::into);
+    }
+
+    // Partial rotation: split x into the rotated prefix and the pass-through suffix.
+    let x_rot = x.narrow(3, 0, rot_dim)?;
+    let x_pass = x.narrow(3, rot_dim, d - rot_dim)?;
+
+    let x1 = x_rot.narrow(3, 0, rot_half)?;
+    let x2 = x_rot.narrow(3, rot_half, rot_half)?;
+
+    // cos/sin broadcast: [1, 1, t, rot_half]
+    let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(0)?;
+    let sin = sin.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(0)?;
+
+    let rotated = Tensor::cat(
+        &[
+            (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?,
+            (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?,
+        ],
+        3,
+    )?;
+
+    Ok(Tensor::cat(&[rotated, x_pass], 3)?)
 }
 
 // ---------------------------------------------------------------------------

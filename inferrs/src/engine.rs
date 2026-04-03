@@ -465,46 +465,17 @@ impl Engine {
             sampling_params.max_tokens
         );
 
-        let mut output_tokens: Vec<u32> = Vec::new();
-        let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
-
-        let logits = self.run_prefill(prompt_tokens)?;
-
-        let mut token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
-        output_tokens.push(token_id);
-        all_tokens.push(token_id);
-
-        let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
-
-        while finish_reason.is_none() {
-            let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
-            let logits = self.run_decode_step(token_id, seqlen_offset)?;
-
-            token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
-            output_tokens.push(token_id);
-            all_tokens.push(token_id);
-            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
-        }
-
-        self.free_paged_blocks();
-
-        let finish_reason = finish_reason.unwrap_or_else(|| "length".to_string());
-        let output_text = self.tokenizer.decode(&output_tokens, true)?;
+        let (result, _prefill_ms, _decode_ms) =
+            self.bench_generate(request_id, prompt_tokens, sampling_params)?;
 
         tracing::debug!(
             "Request {} finished: {} output tokens, reason: {}",
             request_id,
-            output_tokens.len(),
-            finish_reason
+            result.completion_tokens,
+            result.finish_reason
         );
 
-        Ok(GenerationResult {
-            prompt_tokens: prompt_tokens.len(),
-            completion_tokens: output_tokens.len(),
-            output_token_ids: output_tokens,
-            output_text,
-            finish_reason,
-        })
+        Ok(result)
     }
 
     // ── Streaming generation ──────────────────────────────────────────────────

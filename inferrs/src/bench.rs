@@ -15,6 +15,7 @@ use anyhow::Result;
 use crate::engine::load_engine;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
+use crate::turbo_quant::GROUP_SIZE;
 use crate::util::format_bytes;
 use crate::ServeArgs;
 
@@ -176,7 +177,6 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // ── KV cache memory estimate ─────────────────────────────────────────────
     let kv_mem_str = {
         let (num_kv_heads, head_dim, num_layers) = raw_config.kv_cache_params(&arch);
-        const GROUP_SIZE: usize = 32;
         // bytes consumed per token across all layers (K + V combined)
         let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant.0 {
             // TurboQuant: nibble-packed indices + f32 per-group absmax scales

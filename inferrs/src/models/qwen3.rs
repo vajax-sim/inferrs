@@ -11,14 +11,12 @@
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{
-    embedding, linear_no_bias, rms_norm, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder,
-};
+use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    apply_rms_norm_heads, causal_mask, compute_logits, concat_kv_cache, paged_write_gather_sdpa,
-    precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
+    apply_rms_norm_heads, apply_rope, causal_mask, compute_logits, concat_kv_cache,
+    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
 };
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
@@ -44,20 +42,6 @@ pub struct Qwen3Config {
     pub device: Device,
     /// When `Some(bits)`, KV cache vectors are quantized using TurboQuant at the given bit-width.
     pub turbo_quant_bits: Option<u8>,
-}
-
-// ---------------------------------------------------------------------------
-// RoPE utilities
-// ---------------------------------------------------------------------------
-
-/// Apply full rotary embedding to query/key tensors using candle's built-in kernel.
-/// x: [batch, n_heads, seq_len, head_dim]
-/// cos/sin: [seq_len, head_dim/2]
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (_b, _h, seq_len, _d) = x.dims4()?;
-    let cos = cos.narrow(0, 0, seq_len)?.contiguous()?;
-    let sin = sin.narrow(0, 0, seq_len)?.contiguous()?;
-    rotary_emb::rope(&x.contiguous()?, &cos, &sin).map_err(Into::into)
 }
 
 // ---------------------------------------------------------------------------

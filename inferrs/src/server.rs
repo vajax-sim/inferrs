@@ -130,6 +130,16 @@ pub struct ErrorDetail {
     pub r#type: String,
 }
 
+// ─── Time helpers ───────────────────────────────────────────────────────────
+
+/// Return the current Unix timestamp in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 // ─── Error helpers ──────────────────────────────────────────────────────────
 
 fn server_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
@@ -258,10 +268,7 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created = unix_now();
     let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
 
     // Apply chat template and tokenize
@@ -288,15 +295,14 @@ async fn chat_completions(
         .or(req.max_tokens)
         .unwrap_or(state.default_params.max_tokens);
     let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
-    let params = SamplingParams {
-        temperature: req.temperature.unwrap_or(state.default_params.temperature),
-        top_p: req.top_p.unwrap_or(state.default_params.top_p),
-        top_k: req.top_k.unwrap_or(state.default_params.top_k),
-        repetition_penalty: req
-            .repetition_penalty
-            .unwrap_or(state.default_params.repetition_penalty),
+    let params = build_sampling_params(
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.repetition_penalty,
         max_tokens,
-    };
+        &state.default_params,
+    );
 
     let is_stream = req.stream.unwrap_or(false);
 
@@ -360,6 +366,17 @@ async fn chat_completions(
     }
 }
 
+/// Serialize `value` to a JSON SSE event.  Returns `None` and logs an error on failure.
+fn to_sse_event<T: serde::Serialize>(value: &T, label: &str) -> Option<Event> {
+    match serde_json::to_string(value) {
+        Ok(json) => Some(Event::default().data(json)),
+        Err(e) => {
+            tracing::error!("Failed to serialize {label}: {e}");
+            None
+        }
+    }
+}
+
 fn make_sse_stream(
     mut token_rx: mpsc::Receiver<StreamToken>,
     request_id: String,
@@ -382,12 +399,9 @@ fn make_sse_stream(
                 finish_reason: None,
             }],
         };
-        match serde_json::to_string(&first_chunk) {
-            Ok(json) => yield Ok(Event::default().data(json)),
-            Err(e) => {
-                tracing::error!("Failed to serialize chat stream role chunk: {e}");
-                return;
-            }
+        match to_sse_event(&first_chunk, "chat stream role chunk") {
+            Some(event) => yield Ok(event),
+            None => return,
         }
 
         // Token chunks
@@ -413,12 +427,9 @@ fn make_sse_stream(
                     finish_reason: token.finish_reason,
                 }],
             };
-            match serde_json::to_string(&chunk) {
-                Ok(json) => yield Ok(Event::default().data(json)),
-                Err(e) => {
-                    tracing::error!("Failed to serialize chat stream chunk: {e}");
-                    break;
-                }
+            match to_sse_event(&chunk, "chat stream chunk") {
+                Some(event) => yield Ok(event),
+                None => break,
             }
         }
 
@@ -483,10 +494,7 @@ async fn completions(
     Json(req): Json<CompletionRequest>,
 ) -> impl IntoResponse {
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created = unix_now();
     let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
 
     // Tokenize the prompt directly
@@ -499,15 +507,14 @@ async fn completions(
 
     let requested_max_tokens = req.max_tokens.unwrap_or(state.default_params.max_tokens);
     let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), state.max_seq_len);
-    let params = SamplingParams {
-        temperature: req.temperature.unwrap_or(state.default_params.temperature),
-        top_p: req.top_p.unwrap_or(state.default_params.top_p),
-        top_k: req.top_k.unwrap_or(state.default_params.top_k),
-        repetition_penalty: req
-            .repetition_penalty
-            .unwrap_or(state.default_params.repetition_penalty),
+    let params = build_sampling_params(
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.repetition_penalty,
         max_tokens,
-    };
+        &state.default_params,
+    );
 
     let is_stream = req.stream.unwrap_or(false);
 
@@ -594,12 +601,9 @@ fn make_completion_sse_stream(
                     finish_reason: token.finish_reason,
                 }],
             };
-            match serde_json::to_string(&chunk) {
-                Ok(json) => yield Ok(Event::default().data(json)),
-                Err(e) => {
-                    tracing::error!("Failed to serialize completion stream chunk: {e}");
-                    break;
-                }
+            match to_sse_event(&chunk, "completion stream chunk") {
+                Some(event) => yield Ok(event),
+                None => break,
             }
         }
 
@@ -609,10 +613,7 @@ fn make_completion_sse_stream(
 }
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created = unix_now();
 
     Json(ModelListResponse {
         object: "list",
@@ -627,6 +628,25 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRespon
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+/// Build [`SamplingParams`] by overlaying per-request values on top of the
+/// server's default params.  Any `None` field falls back to the default.
+fn build_sampling_params(
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<usize>,
+    repetition_penalty: Option<f64>,
+    max_tokens: usize,
+    defaults: &SamplingParams,
+) -> SamplingParams {
+    SamplingParams {
+        temperature: temperature.unwrap_or(defaults.temperature),
+        top_p: top_p.unwrap_or(defaults.top_p),
+        top_k: top_k.unwrap_or(defaults.top_k),
+        repetition_penalty: repetition_penalty.unwrap_or(defaults.repetition_penalty),
+        max_tokens,
+    }
 }
 
 /// Clamp `requested` so that `prompt_len + result <= max_seq_len`.

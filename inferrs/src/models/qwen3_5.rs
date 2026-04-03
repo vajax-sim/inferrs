@@ -13,8 +13,8 @@ use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm,
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    apply_output_gate, apply_rms_norm_heads, causal_mask, compute_logits, concat_kv_cache,
-    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
+    apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
+    concat_kv_cache, paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,53 +51,6 @@ pub struct Qwen35Config {
     pub tie_word_embeddings: bool,
     pub dtype: DType,
     pub device: Device,
-}
-
-// ---------------------------------------------------------------------------
-// RoPE utilities
-// ---------------------------------------------------------------------------
-
-/// Apply rotary embedding to query/key tensors.
-/// x: [batch, n_heads, seq_len, head_dim]
-/// cos/sin: [seq_len, rot_half]  (half of rot_dim)
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (_b, _h, t, d) = x.dims4()?;
-    let rot_half = cos.dim(1)?;
-    let rot_dim = rot_half * 2;
-
-    if rot_dim > d {
-        anyhow::bail!("rot_dim {rot_dim} > head_dim {d}");
-    }
-
-    // Split x into rotated and pass-through parts
-    let x_rot = x.narrow(3, 0, rot_dim)?;
-    let x_pass = if rot_dim < d {
-        Some(x.narrow(3, rot_dim, d - rot_dim)?)
-    } else {
-        None
-    };
-
-    // x_rot: [b, h, t, rot_dim] -> split into two halves along last dim
-    let x1 = x_rot.narrow(3, 0, rot_half)?;
-    let x2 = x_rot.narrow(3, rot_half, rot_half)?;
-
-    // cos/sin broadcast: [1, 1, t, rot_half]
-    let cos = cos.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(0)?;
-    let sin = sin.narrow(0, 0, t)?.unsqueeze(0)?.unsqueeze(0)?;
-
-    // rotate_half: (x1, x2) -> (-x2, x1)
-    let rotated = Tensor::cat(
-        &[
-            (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?,
-            (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?,
-        ],
-        3,
-    )?;
-
-    match x_pass {
-        Some(pass) => Ok(Tensor::cat(&[rotated, pass], 3)?),
-        None => Ok(rotated),
-    }
 }
 
 // ---------------------------------------------------------------------------
