@@ -69,7 +69,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         model_files.gguf_path.as_deref(),
         dtype,
         &device,
-        serve.turbo_quant,
+        serve.turbo_quant.0,
     )?;
 
     let mut engine = Engine::new(
@@ -218,7 +218,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         let (num_kv_heads, head_dim, num_layers) = raw_config.kv_cache_params(&arch);
         const GROUP_SIZE: usize = 32;
         // bytes consumed per token across all layers (K + V combined)
-        let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant {
+        let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant.0 {
             // TurboQuant: nibble-packed indices + f32 per-group absmax scales
             let index_bytes = if bits <= 4 {
                 // two indices packed per byte

@@ -17,6 +17,37 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+/// CLI argument for `--turbo-quant`.
+///
+/// Parses as either a bit-width (1–8) or the literal string `"false"` to
+/// explicitly disable TurboQuant.  The default value is `"8"` (8-bit), so
+/// TurboQuant is **on by default** — pass `--turbo-quant=false` to turn it off.
+#[derive(Clone, Debug)]
+pub struct TurboQuantArg(pub Option<u8>);
+
+impl std::str::FromStr for TurboQuantArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("false") {
+            return Ok(TurboQuantArg(None));
+        }
+        match s.parse::<u8>() {
+            Ok(n) if (1..=8).contains(&n) => Ok(TurboQuantArg(Some(n))),
+            _ => Err(format!("expected a bit-width (1–8) or 'false', got '{s}'")),
+        }
+    }
+}
+
+impl std::fmt::Display for TurboQuantArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(n) => write!(f, "{n}"),
+            None => write!(f, "false"),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "inferrs", about = "A TurboQuant inference engine")]
 struct Cli {
@@ -108,13 +139,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub paged_attention: Option<f64>,
 
-    /// Enable TurboQuant KV cache compression (Qwen3 only).
-    /// Use as a flag (`--turbo-quant`) for the default 8-bit compression, or with an explicit
-    /// bit-width (`--turbo-quant=N`) for 1–8 bits.  Indices are nibble-packed for bits ≤ 4.
-    /// 8-bit (the default) gives ~2× compression vs bf16 with near-lossless quality.
+    /// TurboQuant KV cache compression bit-width (Qwen3/Gemma4).
+    /// Enabled by default at 8 bits (~2× KV memory reduction, near-lossless quality).
+    /// Pass an explicit bit-width (`--turbo-quant=N`, 1–8) to change the compression level.
     /// 4-bit gives ~3.5× but may produce poor output on models with large QK-norm values.
-    #[arg(long, num_args(0..=1), default_missing_value("8"), require_equals(true))]
-    pub turbo_quant: Option<u8>,
+    /// Disable entirely with `--turbo-quant=false`.
+    #[arg(long, default_value = "8", require_equals(true))]
+    pub turbo_quant: TurboQuantArg,
 
     /// Quantize model weights and cache the result on disk as a GGUF file.
     /// On first use the weights are quantized and saved next to the HuggingFace cache;

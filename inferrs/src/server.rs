@@ -234,7 +234,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         model_files.gguf_path.as_deref(),
         dtype,
         &device,
-        args.turbo_quant,
+        args.turbo_quant.0,
     )?;
 
     // Effective sequence-length cap for this model.
