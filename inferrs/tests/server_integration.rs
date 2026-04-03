@@ -87,11 +87,11 @@ fn looks_intelligible(text: &str) -> bool {
     text.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-/// Starts `inferrs serve <model_id>` with TurboQuant KV-cache compression enabled.
+/// Starts `inferrs serve <model_id>` with an explicit TurboQuant bit-width.
 ///
-/// Passes `--turbo-quant=<bits>` to enable the TurboQuant quantized KV cache
-/// instead of the default full-precision cache.  Uses `require_equals` syntax
-/// as defined in the CLI (`--turbo-quant=4` for 4-bit).
+/// TurboQuant is on by default (8-bit); this helper overrides the bit-width via
+/// `--turbo-quant=<bits>`.  Uses `require_equals` syntax as defined in the CLI
+/// (`--turbo-quant=4` for 4-bit).
 fn spawn_server_turbo(model_id: &str, port: u16, bits: u8) -> Child {
     let bin = env!("CARGO_BIN_EXE_inferrs");
     let turbo_flag = format!("--turbo-quant={}", bits);

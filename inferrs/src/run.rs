@@ -69,13 +69,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub paged_attention: Option<f64>,
 
-    /// Enable TurboQuant KV cache compression (Qwen3 only).
-    /// Use as a flag (`--turbo-quant`) for the default 8-bit compression, or with an explicit
-    /// bit-width (`--turbo-quant=N`) for 1–8 bits.  Indices are nibble-packed for bits ≤ 4.
-    /// 8-bit (the default) gives ~2× compression vs bf16 with near-lossless quality.
+    /// TurboQuant KV cache compression bit-width (Qwen3/Gemma4).
+    /// Enabled by default at 8 bits (~2× KV memory reduction, near-lossless quality).
+    /// Pass an explicit bit-width (`--turbo-quant=N`, 1–8) to change the compression level.
     /// 4-bit gives ~3.5× but may produce poor output on models with large QK-norm values.
-    #[arg(long, num_args(0..=1), default_missing_value("8"), require_equals(true))]
-    pub turbo_quant: Option<u8>,
+    /// Disable entirely with `--turbo-quant=false`.
+    #[arg(long, default_value = "8", require_equals(true))]
+    pub turbo_quant: crate::TurboQuantArg,
 
     /// Quantize model weights and cache the result on disk as a GGUF file.
     /// On first use the weights are quantized and saved next to the HuggingFace cache;
@@ -111,7 +111,7 @@ impl RunArgs {
             top_k: self.top_k,
             max_tokens: self.max_tokens,
             paged_attention: self.paged_attention,
-            turbo_quant: self.turbo_quant,
+            turbo_quant: self.turbo_quant.clone(),
             quantize: self.quantize.clone(),
         }
     }
@@ -174,7 +174,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         model_files.gguf_path.as_deref(),
         dtype,
         &device,
-        args.turbo_quant,
+        args.turbo_quant.0,
     )?;
 
     // Engine tokenizer (separate instance — engine runs on its own thread)
