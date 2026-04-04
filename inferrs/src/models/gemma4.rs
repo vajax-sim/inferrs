@@ -1612,8 +1612,14 @@ impl DecoderLayer {
 
 /// Top-level PLI tensors — only present when `hidden_size_per_layer_input > 0`.
 struct ModelPli {
-    /// [vocab_size, num_layers * pli_dim], scaled by `sqrt(pli_dim) / sqrt(2)`.
-    embed_tokens_per_layer: candle_nn::Embedding,
+    /// [vocab_size, num_layers * pli_dim] weight kept on CPU.
+    ///
+    /// This table is 4.7 GB in BF16 for E2B — too large to fit in 6 GB VRAM
+    /// alongside the model weights.  We keep it on CPU and transfer only the
+    /// looked-up rows (one per input token) to the GPU in the forward pass.
+    embed_tokens_per_layer_cpu: Tensor,
+    /// GPU device to transfer lookup results to.
+    gpu_device: Device,
     /// hidden_size -> num_layers * pli_dim
     per_layer_model_projection: QLinear,
     /// RMS norm applied per pli_dim slice.
@@ -1674,11 +1680,12 @@ impl Gemma4Model {
         // PLI tensors — only for efficient variants (hidden_size_per_layer_input > 0).
         let model_pli = if cfg.hidden_size_per_layer_input > 0 {
             let pli_dim = cfg.hidden_size_per_layer_input;
-            let embed_tokens_per_layer = candle_nn::embedding(
-                cfg.vocab_size,
-                cfg.num_hidden_layers * pli_dim,
-                vb_lm.pp("embed_tokens_per_layer"),
-            )?;
+            // Load embed_tokens_per_layer on CPU to avoid exhausting VRAM.
+            // This table is ~4.7 GB in BF16 for E2B. We keep it CPU-resident
+            // and transfer only the per-token lookup result to the GPU.
+            let cpu_vb = vb_lm.pp("embed_tokens_per_layer").set_device(Device::Cpu);
+            let embed_tokens_per_layer_cpu =
+                cpu_vb.get((cfg.vocab_size, cfg.num_hidden_layers * pli_dim), "weight")?;
             let per_layer_model_projection = qlinear_b(
                 cfg.hidden_size,
                 cfg.num_hidden_layers * pli_dim,
@@ -1703,7 +1710,8 @@ impl Gemma4Model {
                 candle_nn::RmsNorm::new(scaled_weight, cfg.rms_norm_eps)
             };
             Some(ModelPli {
-                embed_tokens_per_layer,
+                embed_tokens_per_layer_cpu,
+                gpu_device: cfg.device.clone(),
                 per_layer_model_projection,
                 per_layer_projection_norm,
                 embed_combined_scale: (pli_dim as f64).sqrt() / 2.0_f64.sqrt(),
@@ -1969,7 +1977,11 @@ impl Gemma4Model {
         // `narrow(...).squeeze(...)` 35 times — identical semantically.  Making the
         // loop explicit here keeps the rest of the forward pass unchanged.
         let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &self.pli {
-            let pli_embed = model_pli.embed_tokens_per_layer.forward(input_ids)?;
+            // Embedding lookup on CPU, then transfer result to GPU.
+            // The full table is CPU-resident to avoid exhausting VRAM.
+            let ids_cpu = input_ids.to_device(&Device::Cpu)?;
+            let pli_embed_cpu = model_pli.embed_tokens_per_layer_cpu.embedding(&ids_cpu)?;
+            let pli_embed = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
             let pli_embed = (pli_embed * model_pli.embed_combined_scale)?;
             let pli_proj = xs.apply(&model_pli.per_layer_model_projection)?;
             let pli_proj =
