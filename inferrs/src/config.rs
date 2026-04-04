@@ -225,6 +225,7 @@ impl RawConfig {
             ),
             rms_norm_eps: self.rms_norm_eps.unwrap_or(RMS_NORM_EPS_DEFAULT),
             rope_theta: self.rope_theta.unwrap_or(10000.0),
+            rope_local_base_freq: self.rope_theta.unwrap_or(10000.0),
             attention_bias: self.attention_bias.unwrap_or(false),
             final_logit_softcapping: self.final_logit_softcapping,
             attn_logit_softcapping: self.attn_logit_softcapping,
