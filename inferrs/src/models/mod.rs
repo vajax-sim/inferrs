@@ -185,6 +185,20 @@ impl candle_nn::var_builder::SimpleBackend for GgufBackend {
         Ok(tensor)
     }
 
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
+        let qt = self
+            .content
+            .tensor(&mut *reader, name, &self.device)
+            .map_err(|e| {
+                candle_core::Error::CannotFindTensor {
+                    path: format!("{name}: {e}"),
+                }
+                .bt()
+            })?;
+        qt.dequantize(dev)?.to_dtype(dtype)
+    }
+
     fn contains_tensor(&self, name: &str) -> bool {
         self.content.tensor_infos.contains_key(name)
     }

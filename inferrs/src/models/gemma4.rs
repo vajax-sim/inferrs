@@ -1159,6 +1159,8 @@ impl Attention {
                 &query_states,
                 &key_states,
                 &value_states,
+                None,
+                false,
                 1.0_f32,
                 softcapping,
             )?
@@ -1226,6 +1228,8 @@ impl Attention {
                 &query_states,
                 shared_key,
                 shared_value,
+                None,
+                false,
                 1.0_f32,
                 softcapping,
             )?
