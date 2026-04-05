@@ -190,8 +190,9 @@ impl ServeArgs {
         }
 
         // Linux: probe backend plugins via dlopen in priority order.
-        // The main binary is compiled CPU-only; GPU support is loaded at
-        // runtime from sibling `.so` files (CUDA, ROCm, Vulkan).
+        // The main binary is compiled with the cuda feature but candle-core
+        // uses cudarc fallback-dynamic-loading so CUDA libs are dlopen'd on
+        // demand — they are not hard-linked into the binary.
         #[cfg(target_os = "linux")]
         {
             use crate::backend::BackendKind;

@@ -1,7 +1,12 @@
 //! Linux GPU backend discovery via `dlopen`.
 //!
-//! The `inferrs` binary is compiled CPU-only (no CUDA/ROCm linked at build
-//! time).  At startup it searches for backend plugin `.so` files alongside the
+//! The `inferrs` binary is compiled with the `cuda` feature (so
+//! `Device::new_cuda()` is available) but candle-core is patched to use
+//! cudarc's `fallback-dynamic-loading` instead of `dynamic-linking`.  This
+//! means CUDA/cuBLAS/cuRAND libraries are **not** hard-linked into the binary;
+//! they are opened on demand via dlopen when a CUDA device is first used.
+//!
+//! At startup the binary searches for backend plugin `.so` files alongside the
 //! running executable and probes each one in priority order.  Each plugin
 //! exports a single C-ABI function:
 //!

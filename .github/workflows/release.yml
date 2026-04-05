@@ -54,11 +54,17 @@ jobs:
           key: release-x86_64-linux
 
       # ── CUDA backend plugin + main binary ───────────────────────────────
-      # Install the CUDA toolkit headers/stubs (no GPU required to compile).
+      # Install the CUDA toolkit so nvcc can compile candle-kernels PTX.
       # The main binary and CUDA backend must be built in the same cargo
       # invocation so that Cargo's feature unification propagates the `cuda`
       # feature to candle-core inside the main binary — without it,
-      # Device::new_cuda() panics at runtime even when the plugin probe succeeds.
+      # Device::new_cuda() is unavailable at runtime even when the plugin
+      # probe succeeds.
+      #
+      # candle-core is patched (candle-core/) to use cudarc with
+      # fallback-dynamic-loading instead of dynamic-linking, so the resulting
+      # binary dlopen()s CUDA libs on demand and has no hard DT_NEEDED entries
+      # for libcuda.so / libcurand.so / libcublas.so.
       - name: Install CUDA toolkit
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb

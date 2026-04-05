@@ -58,8 +58,11 @@ crossterm = "0.28"
 indicatif = "0.17"
 
 # Linux: dynamic backend loading + CUDA device support.
-# Enable the cuda feature so Device::new_cuda() is available at runtime
-# when the CUDA plugin probe succeeds (x86_64 and aarch64 both support CUDA).
+# Enable the cuda feature so Device::new_cuda() is available at runtime.
+# candle-core is patched (see [patch.crates-io] in the workspace Cargo.toml)
+# to use cudarc with fallback-dynamic-loading instead of dynamic-linking,
+# so libcuda / libcurand / libcublas are NOT hard-linked into the binary —
+# they are dlopen'd on demand when a CUDA device is first used.
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
 candle-core = { workspace = true, features = ["cuda"] }
