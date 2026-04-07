@@ -28,6 +28,220 @@ use std::sync::Arc;
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache, MIN_KV_BUFFER_CAP};
 
 // ---------------------------------------------------------------------------
+// PLI embedding cache size
+//
+// The per-layer input (PLI) embedding is a pure function of the token ID,
+// so the result of the CPU lookup + CPU→GPU DMA + scale multiply can be
+// reused across decode steps.  We cache at most this many entries; older
+// entries are evicted in LRU order.
+const PLI_EMBED_CACHE_SIZE: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// PliEmbeddingTable: memory-efficient quantized PLI embedding lookup
+//
+// The `embed_tokens_per_layer` table is [vocab_size, num_layers * pli_dim]
+// and is 4.7 GB in BF16 for Gemma4-E2B-it.  Loading it fully dequantized
+// consumes most of the process RSS.
+//
+// `PliEmbeddingTable` stores the table in its GGUF-quantized form (Q6K,
+// ~1.93 GB for E2B) and dequantizes one row at a time on demand.  This
+// reduces peak memory by ~2.8 GB.
+//
+// The per-row dequantization (Q6K → BF16 for 8960 elements) takes ~20 µs
+// on a modern CPU — a one-time cost per unique token, amortised by the
+// PLI embed cache above.
+// ---------------------------------------------------------------------------
+
+/// Memory-efficient per-row embedding lookup for the PLI embedding table.
+///
+/// The `embed_tokens_per_layer` table is [vocab_size, num_layers * pli_dim]
+/// and is 4.7 GB in BF16 for Gemma4-E2B-it.  When the GGUF path is active,
+/// this struct keeps the table in its quantized form (Q6K, ~1.9 GB) and
+/// dequantizes one row at a time on demand — reducing peak CPU RAM by ~2.8 GB.
+///
+/// When loaded from safetensors (no --quantize), the full BF16 tensor is
+/// wrapped and row lookups use `index_select`.
+#[derive(Clone, Debug)]
+enum PliEmbeddingTable {
+    /// GGUF-file-backed on-demand row lookup (zero CPU RAM for the table).
+    ///
+    /// Rows are read directly from the GGUF file as needed, with results
+    /// cached by token ID (via the model-level `pli_embed_cache`).  This
+    /// keeps the PLI embedding table out of CPU RAM entirely, reducing peak
+    /// RSS by ~1.9 GB compared to the `Quantized` variant.
+    GgufFile {
+        /// GGUF file, shared among all model components.
+        file: Arc<std::sync::Mutex<std::fs::File>>,
+        /// Absolute file offset where tensor data starts.
+        tensor_offset: u64,
+        #[allow(dead_code)]
+        vocab_size: usize,
+        #[allow(dead_code)]
+        embed_dim: usize,
+        /// Bytes per row (determined by the quantization format).
+        row_bytes: usize,
+        /// GGUF quantization type for the PLI embedding.
+        dtype_q: candle_core::quantized::GgmlDType,
+    },
+    /// Quantized form (GGUF path): raw bytes + shape info for the full table.
+    /// `qtensor` is kept alive so the data pointer remains valid.
+    Quantized {
+        qtensor: Arc<candle_core::quantized::QTensor>,
+        #[allow(dead_code)]
+        vocab_size: usize,
+        #[allow(dead_code)]
+        embed_dim: usize,
+        /// Bytes per row in the raw quantized layout.
+        row_bytes: usize,
+    },
+    /// Dequantized BF16 tensor (safetensors path).
+    Dense(candle_core::Tensor),
+}
+
+impl PliEmbeddingTable {
+    /// Build from an open GGUF file (zero-copy, minimal RAM usage).
+    ///
+    /// Reads individual rows directly from the GGUF file on demand.
+    /// The PLI embedding table is NOT loaded into CPU RAM.
+    fn from_gguf_file(gguf_path: &std::path::Path) -> candle_core::Result<Option<Self>> {
+        use candle_core::quantized::gguf_file;
+
+        let mut file = std::fs::File::open(gguf_path).map_err(candle_core::Error::from)?;
+        let content = gguf_file::Content::read(&mut file)?;
+
+        // Find the PLI embedding tensor.
+        let tensor_name = "model.language_model.embed_tokens_per_layer.weight";
+        let info = match content.tensor_infos.get(tensor_name) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let embed_dim = info.shape.dims()[1];
+        let vocab_size = info.shape.dims()[0];
+        let dtype_q = info.ggml_dtype;
+        let block_size = dtype_q.block_size();
+        let type_size = dtype_q.type_size();
+
+        if embed_dim % block_size != 0 {
+            return Ok(None); // non-aligned, can't safely slice by row
+        }
+
+        let blocks_per_row = embed_dim / block_size;
+        let row_bytes = blocks_per_row * type_size;
+        let tensor_offset = content.tensor_data_offset + info.offset;
+
+        Ok(Some(PliEmbeddingTable::GgufFile {
+            file: Arc::new(std::sync::Mutex::new(file)),
+            tensor_offset,
+            vocab_size,
+            embed_dim,
+            row_bytes,
+            dtype_q,
+        }))
+    }
+
+    /// Build from an `Arc<QTensor>` (GGUF quantized path, ~1.9 GB RAM).
+    fn from_qtensor(qt: Arc<candle_core::quantized::QTensor>) -> candle_core::Result<Self> {
+        let (vocab_size, embed_dim) = qt.shape().dims2()?;
+        let total_bytes = qt.data()?.len();
+        let row_bytes = total_bytes / vocab_size;
+        Ok(PliEmbeddingTable::Quantized {
+            qtensor: qt,
+            vocab_size,
+            embed_dim,
+            row_bytes,
+        })
+    }
+
+    /// Build from a dequantized CPU tensor (safetensors path).
+    fn from_tensor(t: candle_core::Tensor) -> Self {
+        PliEmbeddingTable::Dense(t)
+    }
+
+    /// Dequantize or look up a batch of token IDs.
+    ///
+    /// `token_ids`: flat slice of token IDs (one per token in the batch).
+    ///
+    /// Returns a CPU BF16 tensor of shape `[n_tokens, embed_dim]`.
+    fn lookup_batch(
+        &self,
+        token_ids: &[u32],
+        embed_dim: usize,
+        dtype: candle_core::DType,
+    ) -> candle_core::Result<candle_core::Tensor> {
+        use candle_core::quantized::{QStorage, QTensor};
+        use std::borrow::Cow;
+        use std::io::{Read, Seek, SeekFrom};
+
+        match self {
+            PliEmbeddingTable::GgufFile {
+                file,
+                tensor_offset,
+                row_bytes,
+                dtype_q,
+                ..
+            } => {
+                let n = token_ids.len();
+                let mut row_data: Vec<u8> = vec![0u8; n * row_bytes];
+                let mut f = file.lock().expect("GGUF file lock poisoned");
+                for (i, &tok) in token_ids.iter().enumerate() {
+                    let file_pos = tensor_offset + tok as u64 * *row_bytes as u64;
+                    f.seek(SeekFrom::Start(file_pos))
+                        .map_err(candle_core::Error::from)?;
+                    f.read_exact(&mut row_data[i * row_bytes..(i + 1) * row_bytes])
+                        .map_err(candle_core::Error::from)?;
+                }
+                let storage =
+                    QStorage::from_data(Cow::Owned(row_data), &candle_core::Device::Cpu, *dtype_q)?;
+                let row_qt = QTensor::new(storage, (n, embed_dim))?;
+                row_qt
+                    .dequantize(&candle_core::Device::Cpu)?
+                    .to_dtype(dtype)
+            }
+            PliEmbeddingTable::Quantized {
+                qtensor, row_bytes, ..
+            } => {
+                let raw = qtensor.data()?;
+                let n = token_ids.len();
+                let dtype_q = qtensor.dtype();
+
+                // Collect the raw bytes for all requested rows.
+                let mut row_data: Vec<u8> = Vec::with_capacity(n * row_bytes);
+                for &tok in token_ids {
+                    let start = tok as usize * row_bytes;
+                    let end = start + row_bytes;
+                    row_data.extend_from_slice(&raw[start..end]);
+                }
+
+                // Build a QTensor of shape [n, embed_dim] from the gathered bytes.
+                let storage =
+                    QStorage::from_data(Cow::Owned(row_data), &candle_core::Device::Cpu, dtype_q)?;
+                let row_qt = QTensor::new(storage, (n, embed_dim))?;
+                row_qt
+                    .dequantize(&candle_core::Device::Cpu)?
+                    .to_dtype(dtype)
+            }
+            PliEmbeddingTable::Dense(t) => {
+                // Use index_select for the dense (safetensors) path.
+                let ids = candle_core::Tensor::new(token_ids, &candle_core::Device::Cpu)?;
+                t.index_select(&ids, 0)?.to_dtype(dtype)
+            }
+        }
+    }
+
+    /// Shorthand: look up a single token.
+    fn lookup_single(
+        &self,
+        token_id: u32,
+        embed_dim: usize,
+        dtype: candle_core::DType,
+    ) -> candle_core::Result<candle_core::Tensor> {
+        self.lookup_batch(&[token_id], embed_dim, dtype)
+            .and_then(|t| t.reshape((1usize, 1usize, embed_dim)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // QLinear: a Linear layer backed by either a standard Tensor or a QMatMul.
 //
 // When weights are loaded from a GGUF file with --quantize, using QMatMul keeps
@@ -90,25 +304,27 @@ impl Module for QLinear {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match &self.inner {
             QMatMul::QTensor(_) => {
-                // The Metal quantized GEMV kernel (kernel_mul_mv_q4_K_f32 etc.)
-                // requires f32 activations and produces f32 output.  We cast
-                // bf16→f32 on input and f32→bf16 on output for both decode and
-                // prefill.  For decode (seq_len=1) this is a true GEMV and is
-                // ~3-4× faster than bf16 GEMV because Q4K weights are 4× smaller
-                // in memory.  For prefill (seq_len>1) the kernel is called once
-                // per token — the two dtype casts are small Metal kernels and the
-                // bandwidth savings still apply.
-                //
-                // This avoids any permanent second copy of the weights and keeps
-                // memory usage at QTensor-only (~4.5 bits/param).
                 let orig_dtype = xs.dtype();
-                let xs_f32 = if orig_dtype == DType::F32 {
-                    xs.clone()
+                // On CUDA with BF16 activations, the patched `dequantize_matmul_vec`
+                // has a BF16 fast path that fuses BF16→Q8_1 in one kernel dispatch
+                // (vs the old two-dispatch BF16→F32 + F32→Q8_1 path).
+                // Pass BF16 input directly and save one kernel launch per GEMV.
+                // Non-CUDA or non-BF16: keep the standard F32 conversion path.
+                let r = if matches!(xs.device(), candle_core::Device::Cuda(_))
+                    && orig_dtype == DType::BF16
+                {
+                    // Direct BF16 path: skip the BF16→F32 conversion kernel.
+                    self.inner.forward(xs)?
                 } else {
-                    xs.to_dtype(DType::F32)?
+                    let xs_f32 = if orig_dtype == DType::F32 {
+                        xs.clone()
+                    } else {
+                        xs.to_dtype(DType::F32)?
+                    };
+                    self.inner.forward(&xs_f32)?
                 };
-                let r = self.inner.forward(&xs_f32)?;
-                let result = if orig_dtype == DType::F32 {
+                // GEMV output is always F32; convert back to orig_dtype if needed.
+                let result = if orig_dtype == DType::F32 || r.dtype() == orig_dtype {
                     r
                 } else {
                     r.to_dtype(orig_dtype)?
@@ -124,6 +340,58 @@ impl Module for QLinear {
                 match &self.bias {
                     None => Ok(result),
                     Some(b) => result.broadcast_add(b),
+                }
+            }
+        }
+    }
+}
+
+impl QLinear {
+    /// Forward pass that takes an already-F32 input and returns F32 output.
+    ///
+    /// When the underlying QMatMul is a QTensor (quantized GGUF path), the
+    /// CUDA/Metal GEMV kernel requires F32 input.  If the caller has already
+    /// converted the activation to F32 (e.g. to amortise the cost across
+    /// multiple QLinear calls that share the same input), calling this method
+    /// directly skips the two dtype-conversion kernel launches that
+    /// `forward()` would add.
+    ///
+    /// For the Dense path (QMatMul::Tensor), this falls through to a
+    /// standard matmul and then converts the result to F32 if needed.
+    #[allow(dead_code)]
+    pub fn forward_f32(&self, xs_f32: &Tensor) -> Result<Tensor> {
+        debug_assert_eq!(xs_f32.dtype(), DType::F32, "forward_f32 requires F32 input");
+        match &self.inner {
+            QMatMul::QTensor(_) => {
+                // No conversion needed — the GEMV kernel already takes F32.
+                let r = self.inner.forward(xs_f32)?;
+                // r is F32; return F32 to the caller.
+                match &self.bias {
+                    None => Ok(r),
+                    Some(b) => {
+                        let b_f32 = if b.dtype() == DType::F32 {
+                            b.clone()
+                        } else {
+                            b.to_dtype(DType::F32)?
+                        };
+                        r.broadcast_add(&b_f32)
+                    }
+                }
+            }
+            _ => {
+                // Dense path: standard matmul, result may be bf16; cast to F32.
+                let result = self.inner.forward(xs_f32)?;
+                let result = if result.dtype() == DType::F32 {
+                    result
+                } else {
+                    result.to_dtype(DType::F32)?
+                };
+                match &self.bias {
+                    None => Ok(result),
+                    Some(b) => {
+                        let b_f32 = b.to_dtype(DType::F32)?;
+                        result.broadcast_add(&b_f32)
+                    }
                 }
             }
         }
@@ -174,10 +442,9 @@ impl QGgufVarBuilder {
         let content = gguf_file::Content::read(&mut file)?;
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
-            // Skip large embedding tables that are not used for GEMV.
-            // embed_tokens_per_layer is enormous (4.7 GB bf16 / 1.76 GB Q6K)
-            // and only used for index-select; loading it here would double its
-            // resident memory alongside the bf16 copy in VarBuilder.
+            // Skip the PLI embedding table — it is loaded via the memory-efficient
+            // GGUF file-backed PliEmbeddingTable::GgufFile which reads rows on
+            // demand without loading 1.9 GB into CPU RAM.
             if tensor_name.contains("embed_tokens_per_layer") {
                 continue;
             }
@@ -207,6 +474,14 @@ impl QGgufVarBuilder {
         } else {
             format!("{}.{}", self.path.join("."), name)
         }
+    }
+
+    /// Retrieve the raw `Arc<QTensor>` for the "weight" tensor at the current path.
+    ///
+    /// Returns `None` if the tensor is not found in the GGUF data map.
+    pub fn get_qtensor(&self) -> Option<Arc<candle_core::quantized::QTensor>> {
+        let name = self.full_name("weight");
+        self.data.get(&name).cloned()
     }
 
     /// Build a bias-free `QLinear` for the "weight" tensor at the current path.
@@ -337,6 +612,7 @@ pub struct Gemma4Config {
 /// Precondition: `norm` must have a 1-D weight of length equal to the last
 /// dimension of `x` (standard `rms_norm(d, eps, vb)` construction ensures this).
 #[inline]
+#[allow(dead_code)]
 fn apply_rms_norm_4d(x: &Tensor, norm: &RmsNorm) -> Result<Tensor> {
     norm.forward(&x.contiguous()?)
 }
@@ -362,6 +638,9 @@ fn apply_rms_norm_4d_with_weight(x: &Tensor, weight: &Tensor, eps: f32) -> Resul
 struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
+    /// F32 copies for the full-F32 decode fast-path (avoids per-step dtype conversion).
+    sin_f32: Tensor,
+    cos_f32: Tensor,
     /// Number of dimensions that are rotated per head.
     rotary_dim: usize,
 }
@@ -386,9 +665,15 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let sin = freqs.sin()?;
+        let cos = freqs.cos()?;
+        let sin_f32 = sin.to_dtype(DType::F32)?;
+        let cos_f32 = cos.to_dtype(DType::F32)?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin,
+            cos,
+            sin_f32,
+            cos_f32,
             rotary_dim,
         })
     }
@@ -426,9 +711,15 @@ impl RotaryEmbedding {
             .to_dtype(dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
+        let sin = freqs.sin()?;
+        let cos = freqs.cos()?;
+        let sin_f32 = sin.to_dtype(DType::F32)?;
+        let cos_f32 = cos.to_dtype(DType::F32)?;
         Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
+            sin,
+            cos,
+            sin_f32,
+            cos_f32,
             rotary_dim,
         })
     }
@@ -440,8 +731,14 @@ impl RotaryEmbedding {
         seqlen_offset: usize,
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, head_dim) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        // Use F32 cos/sin when q is F32 (full-F32 decode fast-path).
+        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
+            (&self.cos_f32, &self.sin_f32)
+        } else {
+            (&self.cos, &self.sin)
+        };
+        let cos = cos_src.narrow(0, seqlen_offset, seq_len)?;
+        let sin = sin_src.narrow(0, seqlen_offset, seq_len)?;
 
         if self.rotary_dim == head_dim {
             let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
@@ -466,8 +763,13 @@ impl RotaryEmbedding {
     /// Apply RoPE only to the query tensor (used for KV-sharing layers where K is reused).
     fn apply_rotary_emb_q(&self, q: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (_b_sz, _h, seq_len, head_dim) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
+        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
+            (&self.cos_f32, &self.sin_f32)
+        } else {
+            (&self.cos, &self.sin)
+        };
+        let cos = cos_src.narrow(0, seqlen_offset, seq_len)?;
+        let sin = sin_src.narrow(0, seqlen_offset, seq_len)?;
 
         if self.rotary_dim == head_dim {
             candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)
@@ -530,6 +832,9 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // The BF16-native GEMV kernel handles BF16 input directly, so no
+        // pre-conversion to F32 is needed. Each QLinear::forward call uses
+        // the fused BF16→Q8_1 path internally.
         let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
         let rhs = xs.apply(&self.up_proj)?;
         (lhs * rhs)?.apply(&self.down_proj)
@@ -749,8 +1054,6 @@ impl RetainingKvCache {
         }
 
         // Grow the buffer if necessary (double until capacity ≥ needed).
-        // Starting from 0, the first allocation sizes to max(needed, 256) so a
-        // single short conversation never allocates more than 256 tokens' worth.
         if needed > self.buf_cap {
             let new_cap = needed
                 .next_power_of_two()
@@ -820,10 +1123,10 @@ struct Attention {
     o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
-    /// All-ones weight for the scale-free value RMSNorm.
-    /// Stored here so `candle_nn::ops::rms_norm` (fused Metal kernel) can be
-    /// used instead of the manual multi-op fallback, saving kernel launches.
+    /// All-ones weight for the scale-free value RMSNorm (model dtype = BF16).
     v_norm_weight: Tensor,
+    /// All-ones weight in F32 for the F32 decode fast path.
+    v_norm_weight_f32: Tensor,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -919,6 +1222,7 @@ impl Attention {
         // construction so the fused `candle_nn::ops::rms_norm` kernel can be
         // used at each forward pass without allocating a new tensor each time.
         let v_norm_weight = Tensor::ones(head_dim, cfg.dtype, &cfg.device)?;
+        let v_norm_weight_f32 = Tensor::ones(head_dim, DType::F32, &cfg.device)?;
 
         let kv_cache = if is_sliding {
             KvCache::Rotating(RetainingRotatingKvCache::new(cfg.sliding_window))
@@ -952,6 +1256,7 @@ impl Attention {
             q_norm,
             k_norm,
             v_norm_weight,
+            v_norm_weight_f32,
             num_heads,
             num_kv_heads,
             num_kv_groups,
@@ -996,15 +1301,21 @@ impl Attention {
         }
 
         // Decode path (q_len == 1) with partial RoPE: use pre-allocated output buffers.
-        let cos = self.rotary_emb.cos.narrow(0, seqlen_offset, 1)?;
-        let sin = self.rotary_emb.sin.narrow(0, seqlen_offset, 1)?;
+        // Use F32 cos/sin when q is F32 (full-F32 decode fast-path).
+        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
+            (&self.rotary_emb.cos_f32, &self.rotary_emb.sin_f32)
+        } else {
+            (&self.rotary_emb.cos, &self.rotary_emb.sin)
+        };
+        let cos = cos_src.narrow(0, seqlen_offset, 1)?;
+        let sin = sin_src.narrow(0, seqlen_offset, 1)?;
         let pass_len = head_dim - rotary_dim;
 
-        // Lazily allocate (or reallocate if batch size changed) the output buffers.
+        // Lazily allocate (or reallocate if batch size or dtype changed) the output buffers.
         let needs_alloc = self
             .partial_rope_q_out
             .as_ref()
-            .is_none_or(|t| t.dim(0).unwrap_or(0) != b_sz);
+            .is_none_or(|t| t.dim(0).unwrap_or(0) != b_sz || t.dtype() != q.dtype());
         if needs_alloc {
             self.partial_rope_q_out = Some(Tensor::zeros(
                 (b_sz, self.num_heads, 1, head_dim),
@@ -1065,14 +1376,19 @@ impl Attention {
             return self.rotary_emb.apply_rotary_emb_q(q, seqlen_offset);
         }
 
-        let cos = self.rotary_emb.cos.narrow(0, seqlen_offset, 1)?;
-        let sin = self.rotary_emb.sin.narrow(0, seqlen_offset, 1)?;
+        let (cos_src, sin_src) = if q.dtype() == DType::F32 {
+            (&self.rotary_emb.cos_f32, &self.rotary_emb.sin_f32)
+        } else {
+            (&self.rotary_emb.cos, &self.rotary_emb.sin)
+        };
+        let cos = cos_src.narrow(0, seqlen_offset, 1)?;
+        let sin = sin_src.narrow(0, seqlen_offset, 1)?;
         let pass_len = head_dim - rotary_dim;
 
         let needs_alloc = self
             .partial_rope_q_out
             .as_ref()
-            .is_none_or(|t| t.dim(0).unwrap_or(0) != b_sz);
+            .is_none_or(|t| t.dim(0).unwrap_or(0) != b_sz || t.dtype() != q.dtype());
         if needs_alloc {
             self.partial_rope_q_out = Some(Tensor::zeros(
                 (b_sz, self.num_heads, 1, head_dim),
@@ -1112,39 +1428,45 @@ impl Attention {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        let query_states = self
-            .q_proj
-            .forward(xs)?
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let key_states = self
-            .k_proj
-            .forward(xs)?
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let value_states = self
-            .v_proj
-            .forward(xs)?
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        // Project Q, K, V and apply per-head norms **before** the transpose so
+        // that the norm inputs are contiguous (no GPU copy needed by contiguous()).
+        //
+        // Layout before transpose: [b, q_len, n_heads, head_dim] — row-major ✓
+        // Layout after  transpose: [b, n_heads, q_len, head_dim] — NOT contiguous ✗
+        //
+        // The BF16-native GEMV kernel (quantize_q8_1_bf16) now handles BF16
+        // activations directly, so there is no need to pre-convert to F32.
+        // Each QLinear::forward call uses the fused BF16→Q8_1 path internally.
+        let q_raw =
+            self.q_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        let k_raw =
+            self.k_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
+        let v_raw =
+            self.v_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
+        // Apply norms on contiguous pre-transpose shape, then transpose.
+        let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
+        let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
+        let v_norm_w = if v_raw.dtype() == DType::F32 {
+            &self.v_norm_weight_f32
+        } else {
+            &self.v_norm_weight
+        };
+        let value_states =
+            apply_rms_norm_4d_with_weight(&v_raw, v_norm_w, 1e-6_f32)?.transpose(1, 2)?;
 
-        // Per-head QK norms (pre-RoPE).
-        // Use apply_rms_norm_4d to ensure the tensor is contiguous before the
-        // fused candle_nn::RmsNorm kernel path is taken.
-        let query_states = apply_rms_norm_4d(&query_states, &self.q_norm)?;
-        let key_states = apply_rms_norm_4d(&key_states, &self.k_norm)?;
-
+        // query_states and key_states are now [b, n_heads, q_len, head_dim] (post-transpose).
         // RoPE — use the buffer-based path to avoid Tensor::cat allocations for
         // partial-RoPE global attention layers during decode.
         let (query_states, key_states) =
             self.apply_rope_qkv_buffered(&query_states, &key_states, seqlen_offset)?;
 
-        // Value-state RMSNorm (scale-free, no learnable weights — matching
-        // the reference v_norm: Gemma4RMSNorm(..., scale_shift=0.0, with_scale=False)).
-        // Uses the stored all-ones weight to access the fused Metal/CUDA kernel
-        // via candle_nn::ops::rms_norm, avoiding the manual multi-op fallback.
-        let value_states =
-            apply_rms_norm_4d_with_weight(&value_states, &self.v_norm_weight, 1e-6_f32)?;
+        // value_states is already normalized and transposed above.
 
         // KV cache — TurboQuant-compressed or plain.
         // Returns accumulated K,V (donor layer stores these for KV-sharing layers).
@@ -1190,24 +1512,31 @@ impl Attention {
         } else {
             // Manual GQA path: use Q-reshape to avoid materializing expanded K/V.
             //
-            // `gqa_attention_no_expand` reshapes Q to merge GQA groups with the
-            // sequence dimension so that K and V are read exactly once from memory
-            // (no `repeat_kv` duplication).  The function handles n_kv_groups=1
-            // as well (standard matmul path).
-            //
-            // Attention scaling: the reference implementation sets self.scaling = 1.0
-            // (no per-element scaling; query_pre_attn_scalar is not used here).
-            gqa_attention_no_expand(
-                &query_states,
-                &key_states,
-                &value_states,
-                self.num_kv_groups,
-                self.attn_logit_softcapping,
-                attention_mask,
-            )?
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, ()))?
-            .apply(&self.o_proj)?
+            // For decode (q_len=1), `gqa_attention_no_expand` returns a result
+            // already shaped [b, q_len, n_q*head_dim] — no transpose needed,
+            // avoiding a non-contiguous tensor and the GPU contiguous() copy.
+            // For prefill (q_len>1), it returns [b, n_q, q_len, head_dim] which
+            // needs the standard transpose+reshape path.
+            {
+                let attn_out = gqa_attention_no_expand(
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    self.num_kv_groups,
+                    self.attn_logit_softcapping,
+                    attention_mask,
+                )?;
+                if q_len == 1 {
+                    // Decode fast path: already [b, q_len, n_q*d] — apply o_proj directly.
+                    attn_out.apply(&self.o_proj)?
+                } else {
+                    // Prefill path: [b, n_q, q_len, d] → transpose → reshape → o_proj.
+                    attn_out
+                        .transpose(1, 2)?
+                        .reshape((b_sz, q_len, ()))?
+                        .apply(&self.o_proj)?
+                }
+            }
         };
 
         Ok((attn_output, key_states, value_states))
@@ -1228,16 +1557,15 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        // Compute Q only (K,V are shared from the donor layer)
-        let query_states = self
-            .q_proj
-            .forward(xs)?
-            .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        // Compute Q only (K,V are shared from the donor layer).
+        // Apply q_norm BEFORE transpose so the input is contiguous (avoids a GPU copy).
+        let q_raw =
+            self.q_proj
+                .forward(xs)?
+                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+        let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
 
-        // Per-head Q norm and RoPE (apply RoPE only to Q) — use buffer-based path
-        // to avoid Tensor::cat allocations for partial-RoPE global layers during decode.
-        let query_states = apply_rms_norm_4d(&query_states, &self.q_norm)?;
+        // RoPE — use buffer-based path for partial-RoPE global layers during decode.
         let query_states = self.apply_rope_q_buffered(&query_states, seqlen_offset)?;
 
         // Use shared K,V directly (no cache update for this layer).
@@ -1259,17 +1587,23 @@ impl Attention {
         }
 
         // Use Q-reshape GQA path: avoids materializing expanded K/V copies.
-        gqa_attention_no_expand(
+        // For decode (q_len=1), the decode fast path returns [b, q_len, n_q*d].
+        let attn_out = gqa_attention_no_expand(
             &query_states,
             shared_key,
             shared_value,
             self.num_kv_groups,
             self.attn_logit_softcapping,
             attention_mask,
-        )?
-        .transpose(1, 2)?
-        .reshape((b_sz, q_len, ()))?
-        .apply(&self.o_proj)
+        )?;
+        if q_len == 1 {
+            attn_out.apply(&self.o_proj)
+        } else {
+            attn_out
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, ()))?
+                .apply(&self.o_proj)
+        }
     }
 
     fn clear_kv_cache(&mut self) {
@@ -1370,6 +1704,18 @@ fn gqa_attention_no_expand(
     // @V: [b, n_kv, n_kv_groups * q_len, head_dim]
     let out = attn_r.matmul(v)?;
 
+    // For decode (q_len=1): the matmul output is [b, n_kv, n_kv_groups, d]
+    // = [b, 1, 8, 256] which is contiguous.  We can skip the reshape to
+    // [b, 8, 1, 256] and let the caller directly reshape to [b, 1, n_q*d].
+    // This avoids the outer transpose(1,2) which would make the tensor
+    // non-contiguous and force a contiguous() GPU copy before o_proj.
+    if q_len == 1 {
+        // Already [b, n_kv, n_kv_groups, head_dim] = [b, 1, n_q, d] — contiguous.
+        // Return as-is; the caller (forward_returning_kv) will reshape directly
+        // to [b, q_len, n_q_heads * head_dim] via a single contiguous reshape.
+        return out.reshape((b, q_len, n_q_heads * head_dim));
+    }
+
     // Reshape to [b, n_q_heads, q_len, head_dim]
     out.reshape((b, n_q_heads, q_len, head_dim))
 }
@@ -1401,6 +1747,8 @@ struct DecoderLayer {
     /// Scalar weight (shape [1]) multiplying the hidden state after MLP+PLI.
     /// Pre-cast to model dtype at construction time.
     layer_scalar: Tensor,
+    /// F32 version of layer_scalar for the F32 decode fast-path.
+    layer_scalar_f32: Tensor,
     /// PLI fields; `None` for models without per-layer input (e.g. 31B).
     pli: Option<LayerPli>,
 }
@@ -1499,7 +1847,9 @@ impl DecoderLayer {
 
         // Pre-cast layer_scalar to the model dtype so the forward pass never
         // needs a runtime to_dtype() conversion (called once per token per layer).
-        let layer_scalar = vb.get(1, "layer_scalar")?.to_dtype(cfg.dtype)?;
+        let layer_scalar_raw = vb.get(1, "layer_scalar")?;
+        let layer_scalar_f32 = layer_scalar_raw.to_dtype(DType::F32)?;
+        let layer_scalar = layer_scalar_raw.to_dtype(cfg.dtype)?;
 
         Ok(Self {
             self_attn,
@@ -1509,6 +1859,7 @@ impl DecoderLayer {
             post_feedforward_layernorm,
             post_attention_layernorm,
             layer_scalar,
+            layer_scalar_f32,
             pli,
         })
     }
@@ -1607,6 +1958,9 @@ impl DecoderLayer {
         //       hidden_states *= layer_scalar                 ← applied to WHOLE state
         let xs = if let (Some(pli), Some(pli_input)) = (&self.pli, per_layer_input) {
             let residual = &xs;
+            // The BF16-native GEMV kernel handles BF16 input directly — no
+            // explicit F32 conversion needed. Each QLinear::forward call uses
+            // the fused BF16→Q8_1 path on CUDA.
             let gate = xs.apply(&pli.gate)?.apply(&pli.act_fn)?;
             let pli_out = gate.broadcast_mul(pli_input)?;
             let pli_out = pli_out.apply(&pli.projection)?;
@@ -1617,8 +1971,12 @@ impl DecoderLayer {
         };
 
         // layer_scalar multiplies the entire hidden state (not just the contribution).
-        // Already cast to model dtype at construction; no runtime conversion needed.
-        xs.broadcast_mul(&self.layer_scalar)
+        let scalar = if xs.dtype() == DType::F32 {
+            &self.layer_scalar_f32
+        } else {
+            &self.layer_scalar
+        };
+        xs.broadcast_mul(scalar)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -1632,12 +1990,16 @@ impl DecoderLayer {
 
 /// Top-level PLI tensors — only present when `hidden_size_per_layer_input > 0`.
 struct ModelPli {
-    /// [vocab_size, num_layers * pli_dim] weight kept on CPU.
+    /// PLI embedding table — memory-efficient per-row lookup.
     ///
-    /// This table is 4.7 GB in BF16 for E2B — too large to fit in 6 GB VRAM
-    /// alongside the model weights.  We keep it on CPU and transfer only the
-    /// looked-up rows (one per input token) to the GPU in the forward pass.
-    embed_tokens_per_layer_cpu: Tensor,
+    /// When `--quantize` is active: Q6K quantized (~1.9 GB for E2B) instead of
+    /// the 4.7 GB BF16 dequantized form.  Individual rows are dequantized on
+    /// demand and cached by token ID for zero-copy decode steps.
+    ///
+    /// When loading from safetensors: plain BF16 tensor (original behaviour).
+    pli_embed_table: PliEmbeddingTable,
+    /// embed_dim = num_hidden_layers * pli_dim.
+    embed_dim: usize,
     /// GPU device to transfer lookup results to.
     gpu_device: Device,
     /// hidden_size -> num_layers * pli_dim
@@ -1647,6 +2009,39 @@ struct ModelPli {
     /// Fused scale for embed_tokens_per_layer: `sqrt(pli_dim) / sqrt(2)`.
     embed_combined_scale: f64,
     pli_dim: usize,
+    /// Cache mapping token_id → scaled GPU pli_embed tensor `[1, 1, num_layers*pli_dim]`.
+    ///
+    /// During single-token decode the PLI embedding is a pure function of the
+    /// token ID, so the GPU tensor (after CPU lookup + DMA + scale multiply) can
+    /// be reused across requests and decode steps without recomputation.
+    ///
+    /// This eliminates:
+    ///   - GPU→CPU synchronisation to transfer the token ID back (stalls pipeline)
+    ///   - CPU `index_select` into the 4.7 GB table (random-access, cache-miss heavy)
+    ///   - CPU→GPU DMA (17.5 KB per step for E2B)
+    ///   - One GPU `mul` kernel (the embed_combined_scale multiply)
+    ///
+    /// The cache is bounded to at most `PLI_EMBED_CACHE_SIZE` entries via LRU
+    /// eviction, implemented with a `VecDeque` of recently used token IDs.
+    pli_embed_cache: std::collections::HashMap<u32, Tensor>,
+    /// LRU order for `pli_embed_cache`; front = least recently used.
+    pli_embed_cache_lru: std::collections::VecDeque<u32>,
+    /// Cache mapping token_id → full `pli_all` tensor `[1, 1, num_layers, pli_dim]` on GPU.
+    ///
+    /// `pli_all = norm(per_layer_model_projection(embed(token_id))) + pli_embed(token_id) * scale`.
+    ///
+    /// Both `per_layer_model_projection` and `pli_embed_table` are pure functions of the
+    /// token ID.  Caching `pli_all` by token ID eliminates, per decode step:
+    ///   - 1 QLinear GEMV (per_layer_model_projection, 2×2048→8960 conversions + GEMV)
+    ///   - 1 RmsNorm over [1,1,35,256]
+    ///   - 1 pli_embed lookup (from pli_embed_cache) + dtype convert
+    ///   - 1 pli_embed scale multiply
+    ///   - 1 reshape + 1 add + 1 contiguous
+    ///
+    /// Total: ~6–8 fewer GPU kernel dispatches per decode step.
+    pli_all_cache: std::collections::HashMap<u32, Vec<Tensor>>,
+    /// LRU order for `pli_all_cache`.
+    pli_all_cache_lru: std::collections::VecDeque<u32>,
 }
 
 pub struct Gemma4Model {
@@ -1680,6 +2075,16 @@ pub struct Gemma4Model {
     /// Cached attention masks to avoid rebuilding the same mask on every prefill call.
     /// Keyed by `(tgt_len, kv_len, seqlen_offset, is_sliding)`.
     mask_cache: std::collections::HashMap<(usize, usize, usize, bool), Tensor>,
+    /// Token ID hint set by `hint_decode_token` before each decode step.
+    ///
+    /// When set, `forward_transformer` uses this token ID directly (no GPU→CPU
+    /// sync) to look up the PLI embedding cache.  Cleared after each forward call.
+    pending_decode_token_id: Option<u32>,
+    /// When `true`, the next `forward` result will be sampled greedily (argmax).
+    /// The model can skip monotonic final-logit transformations (e.g. softcapping)
+    /// that do not affect argmax, saving up to 3 GPU kernel dispatches over the
+    /// full vocab (262K elements) per decode step.
+    skip_final_softcap: bool,
 }
 
 impl Gemma4Model {
@@ -1688,7 +2093,12 @@ impl Gemma4Model {
     /// `qvb` — when `Some`, projection weights are loaded as `QMatMul::QTensor`
     /// (quantized GGUF path, fast Metal GEMV); when `None`, loaded as plain
     /// bf16 tensors from `vb` (safetensors path or dequantized GGUF).
-    pub fn new(cfg: &Gemma4Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
+    pub fn new(
+        cfg: &Gemma4Config,
+        vb: VarBuilder,
+        qvb: Option<&QGgufVarBuilder>,
+        gguf_path: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let vb_lm = vb.pp("model").pp("language_model");
         let qvb_lm = qvb.map(|q| q.pp("model").pp("language_model"));
 
@@ -1700,15 +2110,57 @@ impl Gemma4Model {
         // PLI tensors — only for efficient variants (hidden_size_per_layer_input > 0).
         let model_pli = if cfg.hidden_size_per_layer_input > 0 {
             let pli_dim = cfg.hidden_size_per_layer_input;
-            // Load embed_tokens_per_layer on CPU to avoid exhausting VRAM.
-            // This table is ~4.7 GB in BF16 for E2B. We keep it CPU-resident
-            // and transfer only the per-token lookup result to the GPU.
-            let cpu_vb = vb_lm.pp("embed_tokens_per_layer").set_device(Device::Cpu);
-            let embed_tokens_per_layer_cpu =
-                cpu_vb.get((cfg.vocab_size, cfg.num_hidden_layers * pli_dim), "weight")?;
+            let embed_dim = cfg.num_hidden_layers * pli_dim;
+
+            // Load embed_tokens_per_layer as a memory-efficient PliEmbeddingTable.
+            //
+            // GGUF path (--quantize): Use a GGUF-file-backed variant that reads
+            // individual rows directly from the GGUF file without loading the full
+            // ~1.9 GB Q6K tensor into CPU RAM.  This reduces peak RSS by ~1.9 GB,
+            // bringing inferrs closer to llama-server's memory footprint.
+            //
+            // Safetensors path: Load dequantized BF16 on CPU as before.
+            let pli_embed_table = if let Some(gguf) = gguf_path {
+                // Try the zero-copy file-backed variant first.
+                match PliEmbeddingTable::from_gguf_file(gguf)? {
+                    Some(t) => {
+                        tracing::info!(
+                            "PLI embedding: using GGUF file-backed zero-copy lookup \
+                             (no CPU RAM for the {:.1} GB table)",
+                            (cfg.vocab_size * embed_dim * 2) as f64 / 1e9,
+                        );
+                        t
+                    }
+                    None => {
+                        tracing::warn!(
+                            "PLI embedding: file-backed lookup failed, falling back to QTensor"
+                        );
+                        if let Some(ref qvb) = qvb_lm {
+                            if let Some(qt) = qvb.pp("embed_tokens_per_layer").get_qtensor() {
+                                PliEmbeddingTable::from_qtensor(qt.clone())?
+                            } else {
+                                let cpu_vb =
+                                    vb_lm.pp("embed_tokens_per_layer").set_device(Device::Cpu);
+                                let t = cpu_vb.get((cfg.vocab_size, embed_dim), "weight")?;
+                                PliEmbeddingTable::from_tensor(t)
+                            }
+                        } else {
+                            let cpu_vb = vb_lm.pp("embed_tokens_per_layer").set_device(Device::Cpu);
+                            let t = cpu_vb.get((cfg.vocab_size, embed_dim), "weight")?;
+                            PliEmbeddingTable::from_tensor(t)
+                        }
+                    }
+                }
+            } else {
+                // Safetensors path: load BF16 on CPU.
+                let cpu_vb = vb_lm.pp("embed_tokens_per_layer").set_device(Device::Cpu);
+                let t = cpu_vb.get((cfg.vocab_size, embed_dim), "weight")?;
+                PliEmbeddingTable::from_tensor(t)
+            };
+
             let per_layer_model_projection = qlinear_b(
                 cfg.hidden_size,
-                cfg.num_hidden_layers * pli_dim,
+                embed_dim,
                 false,
                 vb_lm.pp("per_layer_model_projection"),
                 qvb_lm
@@ -1730,12 +2182,17 @@ impl Gemma4Model {
                 candle_nn::RmsNorm::new(scaled_weight, cfg.rms_norm_eps)
             };
             Some(ModelPli {
-                embed_tokens_per_layer_cpu,
+                pli_embed_table,
+                embed_dim,
                 gpu_device: cfg.device.clone(),
                 per_layer_model_projection,
                 per_layer_projection_norm,
                 embed_combined_scale: (pli_dim as f64).sqrt() / 2.0_f64.sqrt(),
                 pli_dim,
+                pli_embed_cache: std::collections::HashMap::new(),
+                pli_embed_cache_lru: std::collections::VecDeque::new(),
+                pli_all_cache: std::collections::HashMap::new(),
+                pli_all_cache_lru: std::collections::VecDeque::new(),
             })
         } else {
             None
@@ -1884,6 +2341,8 @@ impl Gemma4Model {
             kv_donor_buf: vec![None; num_hidden_layers],
             is_sliding_per_layer,
             mask_cache: std::collections::HashMap::new(),
+            pending_decode_token_id: None,
+            skip_final_softcap: false,
         })
     }
 
@@ -2084,34 +2543,128 @@ impl Gemma4Model {
         // The previous code applied `pli_proj + pli_embed` then looped
         // `narrow(...).squeeze(...)` 35 times — identical semantically.  Making the
         // loop explicit here keeps the rest of the forward pass unchanged.
-        let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &self.pli {
-            // Embedding lookup on CPU, then transfer result to GPU.
-            // The full table is CPU-resident to avoid exhausting VRAM.
-            let ids_cpu = ids_for_pli.to_device(&Device::Cpu)?;
-            let embed_dim = model_pli.embed_tokens_per_layer_cpu.dim(1)?;
-            let mut out_dims = ids_cpu.dims().to_vec();
-            out_dims.push(embed_dim);
-            let ids_flat = ids_cpu.flatten_all()?;
-            let pli_embed_cpu = model_pli
-                .embed_tokens_per_layer_cpu
-                .index_select(&ids_flat, 0)?
-                .reshape(out_dims)?;
-            let pli_embed = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
-            let pli_embed = (pli_embed * model_pli.embed_combined_scale)?;
-            // For the audio path, per_layer_model_projection must use text-only embeddings
-            // (PAD at audio positions), matching the reference Gemma4Model.forward() which
-            // computes per_layer_inputs from llm_inputs_embeds (not the audio-injected ones).
-            let proj_input = xs_for_pli.unwrap_or(&xs);
-            let pli_proj = proj_input.apply(&model_pli.per_layer_model_projection)?;
-            let pli_proj =
-                pli_proj.reshape((b_size, seq_len, self.num_hidden_layers, model_pli.pli_dim))?;
-            let pli_proj = model_pli.per_layer_projection_norm.forward(&pli_proj)?;
-            let pli_embed =
-                pli_embed.reshape((b_size, seq_len, self.num_hidden_layers, model_pli.pli_dim))?;
-            let pli_all = (pli_proj + pli_embed)?.contiguous()?;
-            (0..self.num_hidden_layers)
-                .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
-                .collect::<candle_core::Result<_>>()?
+        let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &mut self.pli {
+            // For the single-token decode path (seq_len == 1, no audio):
+            // `pli_all = norm(per_layer_model_projection(embed(token))) + scaled_pli_embed(token)`
+            // is a pure function of the token ID.  Cache it by token ID to avoid:
+            //   1. GPU→CPU sync (token ID hint skips this)
+            //   2. PLI embedding lookup from file / CPU RAM
+            //   3. CPU→GPU DMA (17.5 KB)
+            //   4. per_layer_model_projection GEMV (large 1536→8960 matrix)
+            //   5. per_layer_projection_norm
+            //   6. pli_embed scale multiply + add + contiguous
+            if seq_len == 1 && xs_for_pli.is_none() && b_size == 1 {
+                // Get token ID (prefer hint to avoid GPU→CPU sync)
+                let token_id = if let Some(id) = self.pending_decode_token_id.take() {
+                    id
+                } else {
+                    let ids_cpu = ids_for_pli.to_device(&Device::Cpu)?;
+                    ids_cpu.flatten_all()?.to_vec1::<u32>()?[0]
+                };
+
+                if let Some(cached_layers) = model_pli.pli_all_cache.get(&token_id) {
+                    // Cache hit: return clones of the pre-sliced per-layer tensors.
+                    cached_layers
+                        .iter()
+                        .map(|t| Some(t.clone()))
+                        .collect::<Vec<_>>()
+                } else {
+                    // Cache miss: compute pli_all and slice into per-layer tensors.
+                    // 1. Get pli_embed (from pli_embed_cache or compute)
+                    let pli_embed = if let Some(cached) = model_pli.pli_embed_cache.get(&token_id) {
+                        cached.clone()
+                    } else {
+                        let embed_dim = model_pli.embed_dim;
+                        let pli_embed_cpu = model_pli
+                            .pli_embed_table
+                            .lookup_single(token_id, embed_dim, self.dtype)?;
+                        let pli_embed_gpu = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
+                        let scaled = (pli_embed_gpu * model_pli.embed_combined_scale)?;
+                        while model_pli.pli_embed_cache.len() >= PLI_EMBED_CACHE_SIZE {
+                            if let Some(evict_id) = model_pli.pli_embed_cache_lru.pop_front() {
+                                model_pli.pli_embed_cache.remove(&evict_id);
+                            } else {
+                                break;
+                            }
+                        }
+                        model_pli.pli_embed_cache.insert(token_id, scaled.clone());
+                        model_pli.pli_embed_cache_lru.push_back(token_id);
+                        scaled
+                    };
+
+                    // 2. pli_proj = norm(per_layer_model_projection(embed(token)))
+                    let pli_proj = xs.apply(&model_pli.per_layer_model_projection)?.reshape((
+                        1usize,
+                        1usize,
+                        self.num_hidden_layers,
+                        model_pli.pli_dim,
+                    ))?;
+                    let pli_proj = model_pli.per_layer_projection_norm.forward(&pli_proj)?;
+                    // pli_embed may be BF16 (cached); match xs dtype for the addition.
+                    let pli_embed_cast = if pli_embed.dtype() != xs.dtype() {
+                        pli_embed.to_dtype(xs.dtype())?
+                    } else {
+                        pli_embed.clone()
+                    };
+                    let pli_embed2 = pli_embed_cast.reshape((
+                        1usize,
+                        1usize,
+                        self.num_hidden_layers,
+                        model_pli.pli_dim,
+                    ))?;
+                    let pli_all = (pli_proj + pli_embed2)?.contiguous()?;
+
+                    // 3. Slice into per-layer tensors and cache.
+                    let per_layer: Vec<Tensor> = (0..self.num_hidden_layers)
+                        .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)))
+                        .collect::<candle_core::Result<Vec<_>>>()?;
+
+                    // Store in pli_all_cache (LRU eviction)
+                    while model_pli.pli_all_cache.len() >= PLI_EMBED_CACHE_SIZE {
+                        if let Some(evict_id) = model_pli.pli_all_cache_lru.pop_front() {
+                            model_pli.pli_all_cache.remove(&evict_id);
+                        } else {
+                            break;
+                        }
+                    }
+                    model_pli.pli_all_cache.insert(token_id, per_layer.clone());
+                    model_pli.pli_all_cache_lru.push_back(token_id);
+
+                    per_layer.into_iter().map(Some).collect::<Vec<_>>()
+                }
+            } else {
+                // Prefill/audio path: compute from scratch for all tokens.
+                let ids_cpu = ids_for_pli.to_device(&Device::Cpu)?;
+                let ids_flat_vec = ids_cpu.flatten_all()?.to_vec1::<u32>()?;
+                let embed_dim = model_pli.embed_dim;
+                let pli_embed_cpu =
+                    model_pli
+                        .pli_embed_table
+                        .lookup_batch(&ids_flat_vec, embed_dim, self.dtype)?;
+                let pli_embed_cpu = pli_embed_cpu.reshape((b_size, seq_len, embed_dim))?;
+                let pli_embed_gpu = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
+                let pli_embed = (pli_embed_gpu * model_pli.embed_combined_scale)?;
+
+                let proj_input = xs_for_pli.unwrap_or(&xs);
+                let pli_proj = proj_input.apply(&model_pli.per_layer_model_projection)?;
+                let pli_proj = pli_proj.reshape((
+                    b_size,
+                    seq_len,
+                    self.num_hidden_layers,
+                    model_pli.pli_dim,
+                ))?;
+                let pli_proj = model_pli.per_layer_projection_norm.forward(&pli_proj)?;
+                let pli_embed = pli_embed.reshape((
+                    b_size,
+                    seq_len,
+                    self.num_hidden_layers,
+                    model_pli.pli_dim,
+                ))?;
+                let pli_all = (pli_proj + pli_embed)?.contiguous()?;
+                (0..self.num_hidden_layers)
+                    .map(|i| pli_all.narrow(2, i, 1).and_then(|t| t.squeeze(2)).map(Some))
+                    .collect::<candle_core::Result<_>>()?
+            }
         } else {
             vec![None; self.num_hidden_layers]
         };
@@ -2179,14 +2732,38 @@ impl Gemma4Model {
             }
         }
 
-        let logits = xs
-            .narrow(1, seq_len - 1, 1)?
-            .apply(&self.norm)?
-            .apply(&self.lm_head)?;
+        let last_hidden = xs.narrow(1, seq_len - 1, 1)?.apply(&self.norm)?;
 
-        let logits = match self.final_logit_softcapping {
-            None => logits,
-            Some(sc) => ((logits / sc)?.tanh()? * sc)?,
+        // Apply final logit softcapping only when it can affect the result.
+        //
+        // softcapping(x) = tanh(x / sc) * sc is a monotonic function (tanh is
+        // monotone, sc > 0), so argmax(softcapping(x)) == argmax(x).  When the
+        // sampler will use argmax (temperature ≈ 0, no repetition penalty), the
+        // three GPU kernel dispatches (div + tanh + mul) over the full vocab
+        // (~262K elements for Gemma4-E2B-it) can be skipped safely.
+        let greedy = self.skip_final_softcap;
+        self.skip_final_softcap = false; // always reset
+
+        // For greedy sampling, keep the lm_head output as F32 (no F32→BF16
+        // conversion needed since argmax works on any numeric dtype).  This saves
+        // one GPU kernel (F32→BF16 over 262K elements = 524 KB) per decode step.
+        let logits = if greedy && matches!(last_hidden.device(), candle_core::Device::Cuda(_)) {
+            // Pass F32 input to lm_head to bypass the F32→BF16 output conversion.
+            // The lm_head GEMV (quantize_q8_1_bf16 + mul_mat_vec) outputs F32;
+            // with F32 input the existing QLinear code keeps it as F32 (no conversion).
+            let h_f32 = last_hidden.to_dtype(DType::F32)?;
+            h_f32.apply(&self.lm_head)? // Output stays F32
+        } else {
+            last_hidden.apply(&self.lm_head)?
+        };
+
+        let logits = if greedy {
+            logits // Skip monotonic softcap
+        } else {
+            match self.final_logit_softcapping {
+                None => logits,
+                Some(sc) => ((logits / sc)?.tanh()? * sc)?,
+            }
         };
 
         Ok(logits)
@@ -2196,5 +2773,23 @@ impl Gemma4Model {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Hint that the next `forward()` call is a single-token decode for `token_id`.
+    ///
+    /// This allows `forward_transformer` to look up the PLI embedding cache using
+    /// the raw `u32` token ID directly, avoiding a GPU→CPU device transfer of
+    /// the `input_ids` tensor.  The hint is consumed and cleared after one call.
+    pub fn hint_decode_token(&mut self, token_id: u32) {
+        self.pending_decode_token_id = Some(token_id);
+    }
+
+    /// Hint that the next `forward()` result will be sampled with `temperature`.
+    ///
+    /// When `temperature < ε` (greedy), the final logit softcapping is skipped
+    /// because `tanh` is monotonic and argmax is invariant to it.
+    pub fn hint_sampling_temperature(&mut self, temperature: f64) {
+        const SAMPLING_EPS: f64 = 1e-5;
+        self.skip_final_softcap = temperature < SAMPLING_EPS;
     }
 }

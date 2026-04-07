@@ -170,12 +170,36 @@ pub struct ServeArgs {
     pub quantize: Option<String>,
 }
 
+/// Disable per-tensor CUDA event tracking on a CUDA device.
+///
+/// cudarc creates a CUDA event for every tensor to track which stream last
+/// used it, enabling safe multi-stream usage.  inferrs uses a single CUDA
+/// stream, so these events are pure overhead: ~68K API calls per decode step
+/// (cuEventCreate + cuEventRecord + cuStreamWaitEvent + cuEventDestroy)
+/// costing ~12 ms of CPU time at full CPU speed — and more when throttled.
+///
+/// Disabling is safe as long as no tensors are shared across different
+/// CUDA streams, which is the case for inferrs.
+fn disable_cuda_event_tracking(_device: &candle_core::Device) {
+    // disable_event_tracking is only compiled in when candle-core has the
+    // "cuda" feature, which on this project is enabled only on Linux.
+    // Use target_os rather than a Cargo feature flag so the condition
+    // correctly reflects when the CUDA backend is actually compiled in.
+    #[cfg(target_os = "linux")]
+    if let candle_core::Device::Cuda(cuda_dev) = _device {
+        unsafe {
+            cuda_dev.disable_event_tracking();
+        }
+    }
+}
+
 impl ServeArgs {
     pub fn resolve_device(&self) -> Result<candle_core::Device> {
         match self.device.as_str() {
             "cpu" => Ok(candle_core::Device::Cpu),
             "cuda" => {
                 let device = candle_core::Device::new_cuda(0)?;
+                disable_cuda_event_tracking(&device);
                 Ok(device)
             }
             "metal" => {
@@ -208,12 +232,14 @@ impl ServeArgs {
                 BackendKind::Cuda => {
                     let device = candle_core::Device::new_cuda(0)?;
                     tracing::info!("Using CUDA device (via plugin)");
+                    disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
                 BackendKind::Rocm => {
                     // ROCm uses the same HIP/CUDA device path in candle.
                     let device = candle_core::Device::new_cuda(0)?;
                     tracing::info!("Using ROCm device (via plugin)");
+                    disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
                 BackendKind::Vulkan => {

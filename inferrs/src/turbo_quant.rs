@@ -275,26 +275,18 @@ fn dequantize_into<T: FromF32>(
 /// Stores nibble-packed indices and per-vector absmax scales independently
 /// per head, so prefill and decode appends compose correctly.
 ///
-/// ## Prefill bypass
+/// ## Prefill bypass and warmup threshold
 ///
-/// During prefill (multi-token appends) the K/V tensors are stored unquantized
-/// on-device in `prefill_kv`.  On the first decode call (`append` with a single
-/// token) the entire prefill batch is compressed in one shot — one GPU→CPU
-/// transfer for all prefill tokens — and `prefill_kv` is cleared.  This
-/// restores prefill throughput to the same level as the unquantized path.
+/// For both the multi-token prefill pass and single-token decode steps below
+/// `warmup_seq_len` tokens, K/V tensors are stored unquantized in a single
+/// pre-allocated on-device buffer (`warmup_kv_buf`) using `slice_set` writes.
+/// This avoids any `Tensor::cat` per decode step (which would allocate a new
+/// GPU buffer each time) and eliminates the CPU↔GPU round-trips and quantization
+/// overhead that add latency without benefit at short sequence lengths.
 ///
-/// ## Warmup threshold
-///
-/// For short sequences the KV tensors are small enough that the GPU kernel for
-/// the attention computation is memory-bandwidth-limited by the weight matrices,
-/// not by the KV cache.  In this regime, the per-layer CPU↔GPU round-trips and
-/// quantization overhead of TurboQuant add latency without saving bandwidth.
-///
-/// To avoid this, `warmup_seq_len` keeps the KV data on-device unquantized
-/// (in `prefill_kv`, using the same zero-copy path as the prefill bypass) until
-/// the total sequence length exceeds the threshold.  Only once the sequence is
-/// long enough for the KV bandwidth to be the dominant cost does the cache flush
-/// and start compressing decode tokens.
+/// Once the warmup threshold is exceeded, the buffer is flushed to the
+/// compressed quantized store in one batch, and subsequent decode tokens are
+/// compressed individually.
 ///
 /// ## Incremental dequantize with pre-allocated buffer
 ///
@@ -329,11 +321,21 @@ pub struct TurboQuantKvCache {
     kv_buffer: Option<(Tensor, Tensor)>,
     /// Maximum sequence length allocated in `kv_buffer`.  Zero until the buffer is created.
     kv_buffer_cap: usize,
-    /// Unquantized on-device KV tensors accumulated during prefill AND during the
-    /// warmup phase.  Cleared (and flushed into the quantized store) once the total
-    /// sequence length reaches `warmup_seq_len`.
-    /// Shape when set: `[1, num_kv_heads, buffered_len, head_dim]`.
-    prefill_kv: Option<(Tensor, Tensor)>,
+    /// Pre-allocated on-device KV buffer for the warmup phase.
+    ///
+    /// During single-token decode steps within the warmup threshold, new tokens
+    /// are written here via `slice_set` instead of allocating a new tensor via
+    /// `Tensor::cat`.  This eliminates N-1 GPU buffer allocations over N warmup
+    /// steps (128 allocations for the 128-token benchmark → ~0.5ms savings).
+    ///
+    /// The buffer is lazily allocated on the first decode-phase append with a
+    /// capacity of at least `warmup_seq_len` tokens, growing by doubling if
+    /// needed.  Shape: `[1, num_kv_heads, buf_cap, head_dim]`.
+    warmup_kv_buf: Option<(Tensor, Tensor)>,
+    /// Number of tokens currently stored in `warmup_kv_buf` (decode phase only).
+    warmup_kv_buf_len: usize,
+    /// Capacity of `warmup_kv_buf` in tokens.
+    warmup_kv_buf_cap: usize,
     /// Sequence-length threshold below which decode tokens are kept on-device
     /// unquantized (no CPU round-trip).  Once the total cached length reaches this
     /// value, the cache switches to the compressed path.  Set to 0 to always
@@ -360,7 +362,9 @@ impl Clone for TurboQuantKvCache {
             cached_seq_len: 0,
             kv_buffer: None,
             kv_buffer_cap: 0,
-            prefill_kv: self.prefill_kv.clone(),
+            warmup_kv_buf: None,
+            warmup_kv_buf_len: 0,
+            warmup_kv_buf_cap: 0,
             warmup_seq_len: self.warmup_seq_len,
         }
     }
@@ -395,7 +399,9 @@ impl TurboQuantKvCache {
             cached_seq_len: 0,
             kv_buffer: None,
             kv_buffer_cap: 0,
-            prefill_kv: None,
+            warmup_kv_buf: None,
+            warmup_kv_buf_len: 0,
+            warmup_kv_buf_cap: 0,
             warmup_seq_len,
         }
     }
@@ -447,14 +453,6 @@ impl TurboQuantKvCache {
         Ok(())
     }
 
-    /// Return the total buffered (unquantized) sequence length in `prefill_kv`.
-    fn prefill_kv_len(&self) -> usize {
-        self.prefill_kv
-            .as_ref()
-            .map(|(k, _)| k.dim(2).unwrap_or(0))
-            .unwrap_or(0)
-    }
-
     /// Append newly computed key and value tensors to the cache.
     ///
     /// `k` and `v`: shape `[1, num_kv_heads, new_seq_len, head_dim]`
@@ -478,29 +476,55 @@ impl TurboQuantKvCache {
             anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
         }
 
-        // Prefill path (new_seq > 1) and warmup phase (total buffered < threshold):
-        // store unquantized on-device; defer compression.
-        let current_buffered = self.prefill_kv_len();
-        let in_warmup = new_seq == 1
-            && self.warmup_seq_len > 0
-            && current_buffered + self.seq_len < self.warmup_seq_len;
+        // Check whether we're in the warmup phase for this token.
+        let total_buffered = self.warmup_kv_buf_len + self.seq_len;
+        let in_warmup = self.warmup_seq_len > 0 && total_buffered < self.warmup_seq_len;
 
-        if new_seq > 1 || in_warmup {
-            // Accumulate into the on-device unquantized buffer.
-            let prefill_kv = match self.prefill_kv.take() {
-                None => (k.clone(), v.clone()),
-                Some((k_prev, v_prev)) => {
-                    let k_cat = Tensor::cat(&[&k_prev, k], 2)?;
-                    let v_cat = Tensor::cat(&[&v_prev, v], 2)?;
-                    (k_cat, v_cat)
+        if in_warmup {
+            // Warmup path (prefill and decode): write into the pre-allocated
+            // warmup buffer via `slice_set`.  This avoids `Tensor::cat` on
+            // every decode step (128+ allocations per request).
+            let needed = self.warmup_kv_buf_len + new_seq;
+            if needed > self.warmup_kv_buf_cap {
+                // Grow the buffer by doubling.
+                let new_cap = needed
+                    .next_power_of_two()
+                    .max(MIN_KV_BUFFER_CAP)
+                    .min(self.warmup_seq_len);
+                let mut k_shape = k.dims().to_vec();
+                k_shape[2] = new_cap;
+                let new_k_buf = Tensor::zeros(k_shape.as_slice(), k.dtype(), k.device())?;
+                let mut v_shape = v.dims().to_vec();
+                v_shape[2] = new_cap;
+                let new_v_buf = Tensor::zeros(v_shape.as_slice(), v.dtype(), v.device())?;
+
+                // Copy existing valid tokens into the new buffer.
+                if self.warmup_kv_buf_len > 0 {
+                    if let Some((kb_old, vb_old)) = &self.warmup_kv_buf {
+                        let k_valid = kb_old.narrow(2, 0, self.warmup_kv_buf_len)?;
+                        let v_valid = vb_old.narrow(2, 0, self.warmup_kv_buf_len)?;
+                        new_k_buf.slice_set(&k_valid, 2, 0)?;
+                        new_v_buf.slice_set(&v_valid, 2, 0)?;
+                    }
                 }
-            };
-            self.prefill_kv = Some(prefill_kv);
+                self.warmup_kv_buf = Some((new_k_buf, new_v_buf));
+                self.warmup_kv_buf_cap = new_cap;
+            }
+
+            let (k_buf, v_buf) = self.warmup_kv_buf.as_mut().expect("buffer allocated above");
+            k_buf.slice_set(k, 2, self.warmup_kv_buf_len)?;
+            v_buf.slice_set(v, 2, self.warmup_kv_buf_len)?;
+            self.warmup_kv_buf_len += new_seq;
         } else {
-            // Past the warmup threshold: flush any buffered unquantized tokens first,
+            // Past the warmup threshold: flush all buffered unquantized tokens first,
             // then compress the new decode token.
-            if let Some((pk, pv)) = self.prefill_kv.take() {
-                self.compress_tensors(&pk, &pv)?;
+            if self.warmup_kv_buf_len > 0 {
+                if let Some((kb, vb)) = &self.warmup_kv_buf {
+                    let k_valid = kb.narrow(2, 0, self.warmup_kv_buf_len)?;
+                    let v_valid = vb.narrow(2, 0, self.warmup_kv_buf_len)?;
+                    self.compress_tensors(&k_valid, &v_valid)?;
+                }
+                self.warmup_kv_buf_len = 0;
             }
             self.compress_tensors(k, v)?;
         }
@@ -552,9 +576,16 @@ impl TurboQuantKvCache {
     /// growing `Tensor::cat` allocation+copy that previously occurred on every
     /// decode step.
     pub fn dequantize(&mut self) -> Result<(Tensor, Tensor)> {
-        // Prefill path: return the unquantized tensors directly.
-        if let Some((k, v)) = &self.prefill_kv {
-            return Ok((k.clone(), v.clone()));
+        // Warmup path: KV data is stored unquantized in the pre-allocated buffer.
+        // Return a zero-copy narrow view — no allocation.
+        if self.warmup_kv_buf_len > 0 {
+            let (kb, vb) = self
+                .warmup_kv_buf
+                .as_ref()
+                .expect("warmup_kv_buf must be set when warmup_kv_buf_len > 0");
+            let k = kb.narrow(2, 0, self.warmup_kv_buf_len)?;
+            let v = vb.narrow(2, 0, self.warmup_kv_buf_len)?;
+            return Ok((k, v));
         }
 
         if self.seq_len == 0 {
@@ -708,9 +739,9 @@ impl TurboQuantKvCache {
         }
         self.seq_len = 0;
         self.cached_seq_len = 0;
-        // Retain kv_buffer and kv_buffer_cap — the allocated Metal buffer is
-        // reused for the next sequence; only the write position is reset.
-        self.prefill_kv = None;
+        // Reset write positions; retain allocated GPU buffers for reuse.
+        self.warmup_kv_buf_len = 0;
+        // kv_buffer and warmup_kv_buf are retained; only lengths are reset.
     }
 }
 

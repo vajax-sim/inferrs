@@ -24,6 +24,20 @@ pub trait CausalLM: Send {
     /// Returns logits for the last token position: shape (batch_size, 1, vocab_size).
     fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor>;
 
+    /// Hint: the next `forward()` call will be a single-token decode step for
+    /// this `token_id`.  Models that cache per-token state (e.g. PLI embeddings)
+    /// can use this to pre-populate the cache without a GPU→CPU device transfer.
+    ///
+    /// The default implementation is a no-op.  Must be called before `forward`.
+    fn hint_decode_token(&mut self, _token_id: u32) {}
+
+    /// Hint: the next `forward()` call result will be sampled with `temperature`.
+    ///
+    /// When `temperature < ε` (greedy decoding), models can skip monotonic
+    /// final-logit transformations (e.g. softcapping) that do not affect argmax.
+    /// The default implementation is a no-op.
+    fn hint_sampling_temperature(&mut self, _temperature: f64) {}
+
     /// Run a paged-attention forward pass.
     ///
     /// The default implementation falls back to `forward`, ignoring the paged
@@ -137,6 +151,14 @@ impl CausalLM for Gemma4ModelWrapper {
         } else {
             Ok(self.inner.forward(input_ids, seqlen_offset)?)
         }
+    }
+
+    fn hint_decode_token(&mut self, token_id: u32) {
+        self.inner.hint_decode_token(token_id);
+    }
+
+    fn hint_sampling_temperature(&mut self, temperature: f64) {
+        self.inner.hint_sampling_temperature(temperature);
     }
 
     fn clear_kv_cache(&mut self) {
@@ -438,7 +460,8 @@ pub fn load_model(
                 config.hidden_size,
                 config.num_key_value_heads,
             );
-            let inner = gemma4::Gemma4Model::new(&config, vb.clone(), gemma4_qvb.as_ref())?;
+            let inner =
+                gemma4::Gemma4Model::new(&config, vb.clone(), gemma4_qvb.as_ref(), gguf_path)?;
 
             // Load audio encoder if audio_config is present in the model config.
             let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {

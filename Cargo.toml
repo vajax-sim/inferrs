@@ -33,3 +33,4 @@ lto = true
 candle-metal-kernels = { path = "candle-metal-kernels" }
 candle-nn = { path = "candle-nn" }
 candle-core = { path = "candle-core" }
+candle-kernels = { path = "candle-kernels" }
