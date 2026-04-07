@@ -266,6 +266,52 @@ fn dequantize_mul_mat_vec(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Quantize a BF16 input directly to Q8_1 without a separate BF16→F32 conversion.
+///
+/// Uses the `quantize_q8_1_bf16` CUDA kernel which fuses the BF16→F32 conversion
+/// with the Q8_1 quantization, reducing two kernel launches to one.
+fn quantize_q8_1_from_bf16(
+    src: &CudaView<half::bf16>,
+    dst: &mut CudaSlice<u8>,
+    k: usize,
+    ky: usize,
+    dev: &CudaDevice,
+) -> Result<()> {
+    let kx_padded = pad(k, MATRIX_ROW_PADDING);
+    let num_blocks = ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE);
+    let q8_1_block_size = GgmlDType::Q8_1.block_size();
+    let q8_1_type_size = GgmlDType::Q8_1.type_size();
+    let num_blocks_per_row = kx_padded / q8_1_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
+
+    const CHUNK_SIZE: usize = 65535;
+    let func = dev.get_or_load_func("quantize_q8_1_bf16", &candle_kernels::QUANTIZED)?;
+
+    let mut rows_processed = 0;
+    while rows_processed < ky {
+        let remaining_rows = ky - rows_processed;
+        let rows_in_chunk = std::cmp::min(CHUNK_SIZE, remaining_rows);
+        let src_start_elem = rows_processed * k;
+        let src_num_elems = rows_in_chunk * k;
+        let src_chunk = src.slice(src_start_elem..(src_start_elem + src_num_elems));
+        let dst_start_byte = rows_processed * dst_row_size_bytes;
+        let dst_num_bytes = rows_in_chunk * dst_row_size_bytes;
+        let dst_chunk = dst.slice(dst_start_byte..(dst_start_byte + dst_num_bytes));
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (num_blocks as u32, rows_in_chunk as u32, 1),
+            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&src_chunk);
+        builder.arg(&dst_chunk);
+        barg!(builder, k as i32, kx_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+        rows_processed += rows_in_chunk;
+    }
+    Ok(())
+}
+
 fn mul_mat_vec_via_q8_1(
     data: &PaddedCudaSlice,
     y: &CudaView<f32>,
@@ -333,6 +379,202 @@ fn mul_mat_vec_via_q8_1(
         /* nrows_dst */ nrows as i32
     );
     unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Fully-fused BF16-input × Q4K GEMV → BF16-output, single kernel.
+///
+/// Replaces the two-kernel path (quantize_q8_1_bf16 + mul_mat_vec_q4K_q8_1_bf16out1)
+/// with a single kernel that quantizes the BF16 input to Q8_1 on-the-fly in
+/// shared memory, then computes the dot product with the quantized weight matrix.
+///
+/// This eliminates one kernel launch per GEMV call (~277 per decode step).
+fn mul_mat_vec_via_fused_bf16(
+    data: &PaddedCudaSlice,
+    y_bf16: &CudaView<half::bf16>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    let kernel_name = match dtype {
+        GgmlDType::Q4_0 => "mul_mat_vec_q4_0_fused_bf16in_bf16out1",
+        GgmlDType::Q2K => "mul_mat_vec_q2_K_fused_bf16in_bf16out1",
+        GgmlDType::Q3K => "mul_mat_vec_q3_K_fused_bf16in_bf16out1",
+        GgmlDType::Q4K => "mul_mat_vec_q4_K_fused_bf16in_bf16out1",
+        GgmlDType::Q5K => "mul_mat_vec_q5_K_fused_bf16in_bf16out1",
+        GgmlDType::Q6K => "mul_mat_vec_q6_K_fused_bf16in_bf16out1",
+        _ => {
+            // Fall back to 2-kernel path for unsupported dtypes.
+            return mul_mat_vec_via_q8_1_bf16out(data, y_bf16, dtype, ncols, nrows, dev);
+        }
+    };
+
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<half::bf16>(nrows)? };
+
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    // Dynamic shared memory: one block_q8_1 (36 bytes) per QK8_1=32 elements.
+    // Use the padded column count so K-quant vec_dot look-ahead offsets stay
+    // within the allocated shared-memory region (see kernel comment).
+    // sizeof(block_q8_1) = sizeof(half2) + QK8_1*sizeof(int8) = 4 + 32 = 36 bytes.
+    // For ncols=1536, MATRIX_ROW_PADDING=512: ncols_padded=2048, 64 blocks × 36B = 2304 bytes.
+    let n_q8_blocks_padded = (ncols_padded + 31) / 32; // = ncols_padded / QK8_1
+    let shared_bytes = (n_q8_blocks_padded * 36) as u32;
+
+    // grid: (nrows, 1, 1), block: (WARP_SIZE=32, nwarps=4, 1)
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nrows as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, 4, 1),
+        shared_mem_bytes: shared_bytes,
+    };
+    let mut builder = func.builder();
+    builder.arg(&data.inner);
+    builder.arg(y_bf16);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        /* ncols_x   */ ncols as i32,
+        /* nrows_x   */ nrows as i32,
+        /* nrows_y   */ ncols_padded as i32,
+        /* nrows_dst */ nrows as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
+/// Like `mul_mat_vec_via_q8_1` but outputs `__nv_bfloat16` directly.
+///
+/// For the decode path (b_size == 1) this eliminates the separate F32→BF16
+/// conversion kernel that normally follows `mul_mat_vec_via_q8_1`, reducing
+/// the kernel count per QLinear GEMV from 3 to 2:
+///   old: quantize_q8_1_bf16 (1) + GEMV→F32 (1) + F32→BF16 (1) = 3 kernels
+///   new: quantize_q8_1_bf16 (1) + GEMV→BF16 (1) = 2 kernels
+/// Thread-local cache for the Q8_1 intermediate buffer used in every
+/// bf16out GEMV call.
+///
+/// Without caching, each GEMV call does a `cuMemAllocAsync` + `cuMemFreeAsync`
+/// for the quantize buffer.  With caching, subsequent calls with the same ncols
+/// reuse the existing allocation, eliminating ~277 stream-ordered alloc/free
+/// calls per decode step after warm-up.
+///
+/// The `dst` (BF16 output) buffer is allocated fresh each call because
+/// `wrap_cuda_slice` takes ownership of it and returning it to a cache would
+/// require unsafe aliasing.  The allocation is cheap enough that caching it
+/// is not necessary.
+struct Bf16GemvBufCache {
+    device_ordinal: usize,
+    /// Q8_1 quantize buffer.  One entry; re-allocated only when ncols changes.
+    q8_buf: Option<cudarc::driver::CudaSlice<u8>>,
+    q8_cap_bytes: usize,
+}
+
+impl Bf16GemvBufCache {
+    fn new() -> Self {
+        Self {
+            device_ordinal: usize::MAX,
+            q8_buf: None,
+            q8_cap_bytes: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.q8_buf = None;
+        self.q8_cap_bytes = 0;
+    }
+}
+
+std::thread_local! {
+    static BF16_GEMV_Q8_BUF: std::cell::RefCell<Bf16GemvBufCache> =
+        std::cell::RefCell::new(Bf16GemvBufCache::new());
+}
+
+fn mul_mat_vec_via_q8_1_bf16out(
+    data: &PaddedCudaSlice,
+    y_bf16: &CudaView<half::bf16>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    // Fuse BF16→Q8_1 quantization in one kernel (avoids the F32 intermediate).
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let y_size_in_bytes = ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+
+    // Obtain both intermediate buffers from the thread-local cache.
+    // After warm-up, every nrows/ncols combination is already cached and
+    // no cuMemAllocAsync calls are made.
+    let ord = dev as *const CudaDevice as usize;
+    let (mut y_q8_1, dst) = BF16_GEMV_Q8_BUF.with(|cell| -> Result<_> {
+        let mut cache = cell.borrow_mut();
+        if cache.device_ordinal != ord {
+            cache.reset();
+            cache.device_ordinal = ord;
+        }
+
+        // Q8_1 buffer (one slot — same ncols across most GEMVs per layer).
+        let q8 = if cache.q8_cap_bytes >= y_size_in_bytes && cache.q8_buf.is_some() {
+            cache.q8_buf.take().unwrap()
+        } else {
+            cache.q8_buf = None;
+            cache.q8_cap_bytes = y_size_in_bytes;
+            unsafe { dev.alloc::<u8>(y_size_in_bytes)? }
+        };
+
+        // Output BF16 buffer: allocated fresh each call (see Bf16GemvBufCache docs).
+        let d = unsafe { dev.alloc::<half::bf16>(nrows)? };
+
+        Ok((q8, d))
+    })?;
+
+    quantize_q8_1_from_bf16(y_bf16, &mut y_q8_1, ncols, 1, dev)?;
+
+    // BF16-output GEMV kernel (batch_size always 1 for this path).
+    let kernel_name = match dtype {
+        GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_bf16out1",
+        GgmlDType::Q4_1 => "mul_mat_vec_q4_1_q8_1_bf16out1",
+        GgmlDType::Q5_0 => "mul_mat_vec_q5_0_q8_1_bf16out1",
+        GgmlDType::Q5_1 => "mul_mat_vec_q5_1_q8_1_bf16out1",
+        GgmlDType::Q8_0 => "mul_mat_vec_q8_0_q8_1_bf16out1",
+        GgmlDType::Q2K => "mul_mat_vec_q2_K_q8_1_bf16out1",
+        GgmlDType::Q3K => "mul_mat_vec_q3_K_q8_1_bf16out1",
+        GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_bf16out1",
+        GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_bf16out1",
+        GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_bf16out1",
+        _ => crate::bail!("unsupported dtype for bf16out GEMV {dtype:?}"),
+    };
+    let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
+
+    let nwarps = 4u32; // always 4 for b_size=1
+    let cfg = cudarc::driver::LaunchConfig {
+        grid_dim: (nrows as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, nwarps, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&data.inner);
+    builder.arg(&y_q8_1);
+    builder.arg(&dst);
+    barg!(
+        builder,
+        /* ncols_x   */ ncols as i32,
+        /* nrows_x   */ nrows as i32,
+        /* nrows_y   */ ncols_padded as i32,
+        /* nrows_dst */ nrows as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    // Return the Q8_1 buffer to the cache for reuse on the next call.
+    // `dst` is not cached because `wrap_cuda_slice` takes ownership of it;
+    // the allocation is cheap enough that skipping the cache is fine.
+    BF16_GEMV_Q8_BUF.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.q8_buf.is_none() {
+            cache.q8_buf = Some(y_q8_1);
+        }
+    });
+
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
@@ -757,12 +999,8 @@ impl QCudaStorage {
         rhs: &CudaStorage,
         rhs_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        use crate::backend::BackendStorage;
         let (nrows, ncols) = self_shape.dims2()?;
-        let rhs = rhs.as_cuda_slice::<f32>()?;
-        let rhs = match rhs_l.contiguous_offsets() {
-            Some((o1, o2)) => rhs.slice(o1..o2),
-            None => Err(crate::Error::RequiresContiguous { op: "dmmv" }.bt())?,
-        };
         let (b_size, k) = match rhs_l.shape().dims() {
             [b, m, k] => (b * m, *k),
             [b, k] => (*b, *k),
@@ -771,6 +1009,100 @@ impl QCudaStorage {
         if ncols != k {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", rhs_l.shape())
         }
+
+        // BF16 fast path: for single-vector decode (b_size == 1), use a fused
+        // BF16→Q8_1 + GEMV→BF16 path that produces BF16 output directly.
+        // This replaces the old 3-kernel chain (BF16→Q8_1 + GEMV→F32 + F32→BF16)
+        // with 2 kernels (BF16→Q8_1 + GEMV→BF16), saving one kernel launch
+        // per GEMV call (~277 GEMVs per decode step = 277 fewer kernel launches).
+        if rhs.dtype() == crate::DType::BF16
+            && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let rhs_bf16 = rhs.as_cuda_slice::<half::bf16>()?;
+            let rhs_bf16 = match rhs_l.contiguous_offsets() {
+                Some((o1, o2)) => rhs_bf16.slice(o1..o2),
+                None => Err(crate::Error::RequiresContiguous { op: "dmmv-bf16" }.bt())?,
+            };
+
+            let mut out_shape = rhs_l.shape().dims().to_vec();
+            out_shape.pop();
+            out_shape.push(nrows);
+
+            if b_size == 1 {
+                // Decode path (single query vector): fused 2-kernel path with BF16 output.
+                let out = mul_mat_vec_via_q8_1_bf16out(
+                    &self.data,
+                    &rhs_bf16,
+                    self.dtype,
+                    ncols,
+                    nrows,
+                    self.device(),
+                )?;
+                return Ok((out, out_shape.into()));
+            }
+
+            // Multi-vector prefill path: BF16→Q8_1 fused, GEMV→F32 (no BF16 output
+            // kernel available for b_size > 1), then return F32 (caller converts).
+            let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+            let y_size_in_bytes =
+                b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+            let mut y_q8_1 = unsafe { self.device().alloc::<u8>(y_size_in_bytes)? };
+            quantize_q8_1_from_bf16(&rhs_bf16, &mut y_q8_1, ncols, b_size, self.device())?;
+
+            let kernel_name = match self.dtype {
+                GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
+                GgmlDType::Q4_1 => "mul_mat_vec_q4_1_q8_1_cuda",
+                GgmlDType::Q5_0 => "mul_mat_vec_q5_0_q8_1_cuda",
+                GgmlDType::Q5_1 => "mul_mat_vec_q5_1_q8_1_cuda",
+                GgmlDType::Q8_0 => "mul_mat_vec_q8_0_q8_1_cuda",
+                GgmlDType::Q2K => "mul_mat_vec_q2_K_q8_1_cuda",
+                GgmlDType::Q3K => "mul_mat_vec_q3_K_q8_1_cuda",
+                GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
+                GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
+                GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+                _ => crate::bail!(
+                    "unsupported dtype for bf16 quantized matmul {:?}",
+                    self.dtype
+                ),
+            };
+            let kernel_name = format!("{kernel_name}{b_size}");
+            let func = self
+                .device()
+                .get_or_load_func(&kernel_name, &candle_kernels::QUANTIZED)?;
+            let dst = unsafe { self.device().alloc::<f32>(nrows * b_size)? };
+            let (nblocks, nwarps) = match b_size {
+                1 => (nrows as u32, 4),
+                2..=4 => ((nrows as u32).div_ceil(2), 4),
+                5..=8 => ((nrows as u32).div_ceil(2), 2),
+                _ => crate::bail!("unexpected bsize {b_size}"),
+            };
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (nblocks, 1, 1),
+                block_dim: (WARP_SIZE as u32, nwarps, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = func.builder();
+            builder.arg(&self.data.inner);
+            builder.arg(&y_q8_1);
+            builder.arg(&dst);
+            barg!(
+                builder,
+                ncols as i32,
+                nrows as i32,
+                ncols_padded as i32,
+                nrows as i32
+            );
+            unsafe { builder.launch(cfg) }.w()?;
+            let out_f32 = CudaStorage::wrap_cuda_slice(dst, self.device().clone());
+            return Ok((out_f32, out_shape.into()));
+        }
+
+        // Standard F32 path
+        let rhs = rhs.as_cuda_slice::<f32>()?;
+        let rhs = match rhs_l.contiguous_offsets() {
+            Some((o1, o2)) => rhs.slice(o1..o2),
+            None => Err(crate::Error::RequiresContiguous { op: "dmmv" }.bt())?,
+        };
 
         let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
             dequantize_mul_mat_vec(&self.data, &rhs, self.dtype, ncols, nrows, self.device())?
@@ -813,6 +1145,15 @@ impl QCudaStorage {
             let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
             storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
         } else {
+            // Convert BF16→F32 if needed before the GEMM kernel (which requires F32 input).
+            let (storage_f32_cow, layout_f32_cow);
+            let (storage, layout) = if storage.dtype() == crate::DType::BF16 {
+                storage_f32_cow = storage.to_dtype(layout, crate::DType::F32)?;
+                layout_f32_cow = crate::Layout::contiguous(layout.shape());
+                (&storage_f32_cow, &layout_f32_cow)
+            } else {
+                (storage, layout)
+            };
             let storage = storage.as_cuda_slice::<f32>()?;
             let storage = match layout.contiguous_offsets() {
                 Some((o1, o2)) => storage.slice(o1..o2),
