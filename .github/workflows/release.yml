@@ -25,13 +25,26 @@ jobs:
         with:
           key: release-aarch64-apple-darwin
 
-      - name: Build
+      - name: Build main binary
         run: cargo build --release --target aarch64-apple-darwin -p inferrs
+
+      # ── OpenVINO backend plugin (no compile-time SDK needed) ─────────────
+      - name: Build OpenVINO backend plugin
+        run: |
+          cargo build --release --target aarch64-apple-darwin \
+            -p inferrs-backend-openvino
 
       - name: Package
         run: |
-          tar -czf inferrs-aarch64-apple-darwin.tar.gz \
-            -C target/aarch64-apple-darwin/release inferrs
+          RELEASE_DIR="target/aarch64-apple-darwin/release"
+          STAGE="inferrs-macos-aarch64"
+          mkdir -p "$STAGE"
+          cp "$RELEASE_DIR/inferrs" "$STAGE/"
+          for lib in \
+            libinferrs_backend_openvino.dylib; do
+            [ -f "$RELEASE_DIR/$lib" ] && cp "$RELEASE_DIR/$lib" "$STAGE/"
+          done
+          tar -czf inferrs-aarch64-apple-darwin.tar.gz "$STAGE"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -114,6 +127,28 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-gnu \
             -p inferrs-backend-vulkan
 
+      # ── OpenVINO backend plugin (no compile-time SDK needed) ─────────────
+      - name: Build OpenVINO backend plugin
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-openvino
+
+      # ── CANN backend plugin (no compile-time CANN SDK needed) ────────────
+      # The CANN plugin probes libascendcl.so via dlopen at runtime; only
+      # the Rust toolchain is required at compile time.
+      - name: Build CANN backend plugin
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-cann
+
+      # ── Hexagon backend plugin (fast-fails gracefully on non-Snapdragon) ─
+      # No compile-time Hexagon SDK is needed; the plugin uses dlopen to
+      # probe libcdsprpc.so at runtime and returns unavailable on x86_64.
+      - name: Build Hexagon backend plugin
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            -p inferrs-backend-hexagon
+
       # ── Package everything into one tarball ──────────────────────────────
       - name: Package
         run: |
@@ -127,8 +162,11 @@ jobs:
           # Backend plugins (ship all; the binary picks the right one at
           # runtime via dlopen — missing plugins are silently skipped)
           for lib in \
+            libinferrs_backend_cann.so \
             libinferrs_backend_cuda.so \
+            libinferrs_backend_hexagon.so \
             libinferrs_backend_musa.so \
+            libinferrs_backend_openvino.so \
             libinferrs_backend_rocm.so \
             libinferrs_backend_vulkan.so; do
             if [ -f "$RELEASE_DIR/$lib" ]; then
@@ -197,6 +235,27 @@ jobs:
           cargo build --release --target aarch64-unknown-linux-gnu \
             -p inferrs-backend-vulkan
 
+      # ── OpenVINO backend plugin (no compile-time SDK needed) ─────────────
+      - name: Build OpenVINO backend plugin
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs-backend-openvino
+
+      # ── CANN backend plugin (no compile-time CANN SDK needed) ────────────
+      # Huawei Ascend NPUs are commonly paired with aarch64 CPUs; the plugin
+      # probes libascendcl.so via dlopen at runtime.
+      - name: Build CANN backend plugin
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs-backend-cann
+
+      # ── Hexagon backend plugin (Snapdragon SoCs on aarch64 Linux) ────────
+      # Probes libcdsprpc.so via dlopen at runtime; no compile-time SDK needed.
+      - name: Build Hexagon backend plugin
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs-backend-hexagon
+
       # ── Package ──────────────────────────────────────────────────────────
       - name: Package
         run: |
@@ -205,8 +264,11 @@ jobs:
           mkdir -p "$STAGE"
           cp "$RELEASE_DIR/inferrs" "$STAGE/"
           for lib in \
+            libinferrs_backend_cann.so \
             libinferrs_backend_cuda.so \
+            libinferrs_backend_hexagon.so \
             libinferrs_backend_musa.so \
+            libinferrs_backend_openvino.so \
             libinferrs_backend_rocm.so \
             libinferrs_backend_vulkan.so; do
             [ -f "$RELEASE_DIR/$lib" ] && cp "$RELEASE_DIR/$lib" "$STAGE/"
@@ -318,6 +380,20 @@ jobs:
       # When candle gains wgpu support and the Vulkan probe is extended to
       # Windows, add a build step and DLL entry here.
 
+      # ── OpenVINO backend plugin (no compile-time SDK needed) ─────────────
+      - name: Build OpenVINO backend plugin
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc `
+            -p inferrs-backend-openvino
+
+      # ── Hexagon backend plugin (fast-fails on x86_64 Windows) ────────────
+      # The probe returns unavailable immediately on non-Snapdragon targets;
+      # including the DLL is harmless and keeps the packaging symmetric.
+      - name: Build Hexagon backend plugin
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc `
+            -p inferrs-backend-hexagon
+
       - name: Package
         shell: pwsh
         run: |
@@ -329,7 +405,9 @@ jobs:
           # LoadLibrary search (next to the executable) finds them automatically.
           foreach ($dll in @(
             "inferrs_backend_cuda.dll",
+            "inferrs_backend_hexagon.dll",
             "inferrs_backend_musa.dll",
+            "inferrs_backend_openvino.dll",
             "inferrs_backend_rocm.dll"
           )) {
             if (Test-Path "$releaseDir\$dll") {
@@ -358,15 +436,38 @@ jobs:
         with:
           key: release-aarch64-windows
 
-      - name: Build
+      - name: Build main binary
         run: cargo build --release --target aarch64-pc-windows-msvc -p inferrs
+
+      # ── Hexagon backend plugin (Snapdragon X Elite on Windows ARM64) ──────
+      # Snapdragon X Elite systems run Windows on ARM64 and have a Hexagon DSP;
+      # the plugin probes libcdsprpc.dll via LoadLibrary at runtime.
+      - name: Build Hexagon backend plugin
+        run: |
+          cargo build --release --target aarch64-pc-windows-msvc `
+            -p inferrs-backend-hexagon
+
+      # ── OpenVINO backend plugin (no compile-time SDK needed) ─────────────
+      - name: Build OpenVINO backend plugin
+        run: |
+          cargo build --release --target aarch64-pc-windows-msvc `
+            -p inferrs-backend-openvino
 
       - name: Package
         shell: pwsh
         run: |
+          $releaseDir = "target\aarch64-pc-windows-msvc\release"
           $stage = "inferrs-windows-aarch64"
           New-Item -ItemType Directory -Force $stage | Out-Null
-          Copy-Item "target\aarch64-pc-windows-msvc\release\inferrs.exe" "$stage\"
+          Copy-Item "$releaseDir\inferrs.exe" "$stage\"
+          foreach ($dll in @(
+            "inferrs_backend_hexagon.dll",
+            "inferrs_backend_openvino.dll"
+          )) {
+            if (Test-Path "$releaseDir\$dll") {
+              Copy-Item "$releaseDir\$dll" "$stage\"
+            }
+          }
           Compress-Archive -Path "$stage\*" -DestinationPath "inferrs-aarch64-pc-windows-msvc.zip"
 
       - uses: actions/upload-artifact@v4
@@ -475,11 +576,15 @@ jobs:
              def install
                bin.install "inferrs"
 
-               # Install GPU backend plugins alongside the binary so the
+               # Install GPU/NPU backend plugins alongside the binary so the
                # inferrs binary can find them via dlopen at runtime.
                %w[
+                 libinferrs_backend_cann.so
                  libinferrs_backend_cuda.so
+                 libinferrs_backend_hexagon.so
                  libinferrs_backend_musa.so
+                 libinferrs_backend_openvino.so
+                 libinferrs_backend_openvino.dylib
                  libinferrs_backend_rocm.so
                  libinferrs_backend_vulkan.so
                ].each do |plugin|
