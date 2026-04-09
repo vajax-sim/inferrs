@@ -173,6 +173,7 @@ pub struct ServeArgs {
     #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
           value_name = "FORMAT")]
     pub quantize: Option<String>,
+
 }
 
 /// Disable per-tensor CUDA event tracking on a CUDA device.

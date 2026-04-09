@@ -164,6 +164,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         args.max_batch_size,
         args.max_tokens_per_step,
     );
+
     engine = attach_paged_kv_if_requested(
         engine,
         args.paged_attention,
@@ -254,8 +255,115 @@ pub enum SyncEngineRequest {
 pub struct StreamToken {
     #[allow(dead_code)]
     pub token_id: u32,
+    /// Visible response text for this token (empty when token is reasoning-only).
     pub text: String,
+    /// Reasoning/thinking text for this token (empty when token is content-only).
+    /// Maps to `delta.reasoning_content` in the OpenAI streaming response,
+    /// matching vllm's `--reasoning-parser` and llama-server's default behaviour.
+    pub reasoning_content: String,
     pub finish_reason: Option<String>,
+}
+
+/// Classification of a single generated token with respect to the thinking block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// Regular content token — goes to `delta.content`.
+    Content,
+    /// Token inside a `<think>…</think>` block — goes to `delta.reasoning_content`.
+    Reasoning,
+    /// Opening or closing delimiter token — suppressed (sent to neither field).
+    Delimiter,
+}
+
+/// Classifies generated tokens with respect to thinking/reasoning blocks.
+///
+/// Some models (e.g. Gemma4, Qwen3.5) emit a `<think>…</think>` reasoning
+/// block before the actual response.  The block is delimited by a dedicated
+/// special token (e.g. `<|think|>` = ID 98 for Gemma4, `<think>` for Qwen).
+///
+/// This classifier routes tokens to either `content` or `reasoning_content`,
+/// matching the behaviour of vllm's `--reasoning-parser` and llama-server's
+/// default `COMMON_REASONING_FORMAT_DEEPSEEK`.  Delimiter tokens are dropped.
+///
+/// The block delimiter acts as a toggle: the first occurrence opens the block,
+/// the second occurrence closes it.  Both delimiter tokens are classified as
+/// `Delimiter` and dropped.
+#[derive(Debug, Default)]
+pub struct ThinkFilter {
+    /// Token ID(s) that open a thinking block.  Empty = disabled.
+    think_token_ids: Vec<u32>,
+    /// Token ID(s) that close a thinking block.
+    close_ids: Vec<u32>,
+    /// Whether we are currently inside a thinking block.
+    pub in_think: bool,
+}
+
+impl ThinkFilter {
+    /// Build a filter from the tokenizer's vocabulary.
+    ///
+    /// Looks up common thinking-block delimiter tokens by their string
+    /// representation and records their IDs.  Returns a no-op filter when
+    /// none are found.
+    pub fn from_tokenizer(tokenizer: &Tokenizer) -> Self {
+        // Thinking block delimiters used by different model families:
+        //
+        //   Gemma4 (google):  <|think|> opens and closes (toggle)
+        //   Qwen3/3.5:        <think> opens, </think> closes
+        //   NVIDIA NVFP4:     <|channel> opens, <channel|> closes
+        //
+        // We collect the open and close token IDs separately.
+        // For toggle-style tokens the same ID appears in both lists.
+        let open_candidates = ["<|think|>", "<think>", "<|channel>"];
+        let close_candidates = ["<|think|>", "</think>", "<channel|>"];
+
+        let mut open_ids = Vec::new();
+        let mut close_ids = Vec::new();
+        for name in &open_candidates {
+            if let Some(id) = tokenizer.token_to_id(name) {
+                open_ids.push(id);
+            }
+        }
+        for name in &close_candidates {
+            if let Some(id) = tokenizer.token_to_id(name) {
+                close_ids.push(id);
+            }
+        }
+        // Deduplicate
+        open_ids.dedup();
+        close_ids.dedup();
+
+        if !open_ids.is_empty() {
+            tracing::debug!(
+                "ThinkFilter: open_ids={:?} close_ids={:?}",
+                open_ids,
+                close_ids
+            );
+        }
+        Self {
+            think_token_ids: open_ids, // reused as open_ids
+            in_think: false,
+            close_ids,
+        }
+    }
+
+    /// Classify one token relative to the current thinking-block state.
+    pub fn classify(&mut self, token_id: u32) -> TokenKind {
+        // Check close first so toggle-style tokens (same ID in both lists)
+        // correctly exit the thinking block on their second occurrence.
+        if self.in_think && self.close_ids.contains(&token_id) {
+            self.in_think = false;
+            return TokenKind::Delimiter;
+        }
+        if !self.in_think && self.think_token_ids.contains(&token_id) {
+            self.in_think = true;
+            return TokenKind::Delimiter;
+        }
+        if self.in_think {
+            TokenKind::Reasoning
+        } else {
+            TokenKind::Content
+        }
+    }
 }
 
 /// Result of a non-streaming generation.
@@ -327,6 +435,7 @@ impl TokenSink {
                     StreamToken {
                         token_id: 0,
                         text: format!("Error: {error}"),
+                        reasoning_content: String::new(),
                         finish_reason: Some("error".to_string()),
                     },
                 );
@@ -364,6 +473,8 @@ struct ActiveSequence {
     /// `true` once the sequence is done (stop token, max length, error, or
     /// client disconnect).
     finished: bool,
+    /// Suppresses thinking-block tokens before they reach the client.
+    think_filter: ThinkFilter,
 }
 
 impl ActiveSequence {
@@ -393,6 +504,7 @@ impl ActiveSequence {
                     block_table: block_size.map(BlockTable::new),
                     prefilled: false,
                     finished: false,
+                    think_filter: ThinkFilter::default(),
                 }
             }
             EngineRequest::GenerateStream {
@@ -417,6 +529,7 @@ impl ActiveSequence {
                     block_table: block_size.map(BlockTable::new),
                     prefilled: false,
                     finished: false,
+                    think_filter: ThinkFilter::default(),
                 }
             }
         }
@@ -464,12 +577,6 @@ impl ActiveSequence {
 
 /// Check whether generation should stop (free-standing helper for use by the
 /// continuous batching loop where `self` is destructured).
-///
-/// Checks in order:
-/// 1. Model-wide EOS / end-of-turn token IDs (`stop_token_ids`).
-/// 2. Per-request extra stop token IDs derived from the `stop` field of an
-///    OpenAI-compatible request (`params.extra_stop_token_ids`).
-/// 3. Token budget exhausted (`max_tokens`).
 fn check_stop(
     token_id: u32,
     num_output_tokens: usize,
@@ -477,9 +584,6 @@ fn check_stop(
     stop_token_ids: &[u32],
 ) -> Option<String> {
     if stop_token_ids.contains(&token_id) {
-        return Some("stop".to_string());
-    }
-    if params.extra_stop_token_ids.contains(&token_id) {
         return Some("stop".to_string());
     }
     if num_output_tokens >= params.max_tokens {
@@ -1115,7 +1219,8 @@ impl Engine {
             while active.len() < effective_batch_size {
                 match rx.try_recv() {
                     Ok(req) => {
-                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        let mut seq = ActiveSequence::from_engine_request(req, block_size);
+                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens, batch_size={})",
                             seq.request_id,
@@ -1132,7 +1237,8 @@ impl Engine {
             if active.is_empty() {
                 match rx.blocking_recv() {
                     Some(req) => {
-                        let seq = ActiveSequence::from_engine_request(req, block_size);
+                        let mut seq = ActiveSequence::from_engine_request(req, block_size);
+                        seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens)",
                             seq.request_id,
@@ -1232,12 +1338,42 @@ impl Engine {
                     &stop_token_ids,
                 );
 
-                let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
-                let client_gone = !seq.sink.send_token(StreamToken {
-                    token_id,
-                    text,
-                    finish_reason: finish_reason.clone(),
-                });
+                let kind = seq.think_filter.classify(token_id);
+                let client_gone = match kind {
+                    TokenKind::Delimiter => {
+                        // Opening/closing delimiter: drop text, but if this is
+                        // the final token still signal finish so [DONE] is sent.
+                        if finish_reason.is_some() {
+                            let _ = seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: String::new(),
+                                reasoning_content: String::new(),
+                                finish_reason: finish_reason.clone(),
+                            });
+                        }
+                        false
+                    }
+                    TokenKind::Reasoning => {
+                        // Inside thinking block: route to reasoning_content.
+                        let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+                        !seq.sink.send_token(StreamToken {
+                            token_id,
+                            text: String::new(),
+                            reasoning_content: text,
+                            finish_reason: finish_reason.clone(),
+                        })
+                    }
+                    TokenKind::Content => {
+                        // Normal content token.
+                        let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+                        !seq.sink.send_token(StreamToken {
+                            token_id,
+                            text,
+                            reasoning_content: String::new(),
+                            finish_reason: finish_reason.clone(),
+                        })
+                    }
+                };
 
                 if finish_reason.is_some() || client_gone {
                     let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
@@ -1403,6 +1539,7 @@ impl Engine {
                         let _ = token_tx.send(StreamToken {
                             token_id: 0,
                             text: format!("Error: {e}"),
+                            reasoning_content: String::new(),
                             finish_reason: Some("error".to_string()),
                         });
                     }
@@ -1533,6 +1670,7 @@ impl Engine {
 
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
+        let mut think_filter = ThinkFilter::from_tokenizer(&self.tokenizer);
 
         // Prefill
         let logits = self.run_prefill(prompt_tokens)?;
@@ -1543,14 +1681,32 @@ impl Engine {
 
         let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-        let text = self.tokenizer.decode(&[token_id], true)?;
-        if !token_tx.send_token(StreamToken {
-            token_id,
-            text,
-            finish_reason: finish_reason.clone(),
-        }) {
-            self.free_paged_blocks();
-            return Ok(());
+        {
+            let kind = think_filter.classify(token_id);
+            if kind != TokenKind::Delimiter {
+                let text = self.tokenizer.decode(&[token_id], true)?;
+                let (content, reasoning) = match kind {
+                    TokenKind::Reasoning => (String::new(), text),
+                    _ => (text, String::new()),
+                };
+                if !token_tx.send_token(StreamToken {
+                    token_id,
+                    text: content,
+                    reasoning_content: reasoning,
+                    finish_reason: finish_reason.clone(),
+                }) {
+                    self.free_paged_blocks();
+                    return Ok(());
+                }
+            } else if finish_reason.is_some() {
+                // Delimiter is final token — signal finish without text.
+                let _ = token_tx.send_token(StreamToken {
+                    token_id,
+                    text: String::new(),
+                    reasoning_content: String::new(),
+                    finish_reason: finish_reason.clone(),
+                });
+            }
         }
         if finish_reason.is_some() {
             self.free_paged_blocks();
@@ -1571,13 +1727,30 @@ impl Engine {
 
             let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
 
-            let text = self.tokenizer.decode(&[token_id], true)?;
-            if !token_tx.send_token(StreamToken {
-                token_id,
-                text,
-                finish_reason: finish_reason.clone(),
-            }) {
-                break;
+            {
+                let kind = think_filter.classify(token_id);
+                if kind != TokenKind::Delimiter {
+                    let text = self.tokenizer.decode(&[token_id], true)?;
+                    let (content, reasoning) = match kind {
+                        TokenKind::Reasoning => (String::new(), text),
+                        _ => (text, String::new()),
+                    };
+                    if !token_tx.send_token(StreamToken {
+                        token_id,
+                        text: content,
+                        reasoning_content: reasoning,
+                        finish_reason: finish_reason.clone(),
+                    }) {
+                        break;
+                    }
+                } else if finish_reason.is_some() {
+                    let _ = token_tx.send_token(StreamToken {
+                        token_id,
+                        text: String::new(),
+                        reasoning_content: String::new(),
+                        finish_reason: finish_reason.clone(),
+                    });
+                }
             }
             if finish_reason.is_some() {
                 break;
@@ -1657,9 +1830,6 @@ impl Engine {
         params: &SamplingParams,
     ) -> Option<String> {
         if self.stop_token_ids.contains(&token_id) {
-            return Some("stop".to_string());
-        }
-        if params.extra_stop_token_ids.contains(&token_id) {
             return Some("stop".to_string());
         }
         if num_output_tokens >= params.max_tokens {
