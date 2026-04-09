@@ -508,20 +508,21 @@ fn query_device_memory(device: &Device) -> usize {
             all(target_os = "windows", target_arch = "x86_64")
         ))]
         Device::Cuda(_cuda_dev) => {
-            // Use cuMemGetInfo to get free memory after model weights are loaded.
+            // Use cuMemGetInfo_v2 to get free memory after model weights are loaded.
             // This is the correct baseline for --paged-attention=<fraction>: the
             // fraction should be relative to what is actually free, not total VRAM.
             // Using total_mem() would try to allocate >100% of VRAM when the model
             // weights already occupy a significant fraction (e.g. 62 GB of 128 GB).
-            match cudarc::runtime::result::get_mem_info() {
-                Ok((free, _total)) => free,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to query CUDA free memory ({e}); falling back to 8 GiB heuristic"
-                    );
-                    8 * 1024 * 1024 * 1024
+            query_cuda_free_memory().unwrap_or_else(|| {
+                // Fall back to total memory if free-memory query fails.
+                match _cuda_dev.cuda_stream().context().total_mem() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!("Failed to query CUDA memory ({e}); falling back to 8 GiB");
+                        8 * 1024 * 1024 * 1024
+                    }
                 }
-            }
+            })
         }
         _ => {
             // On Linux/Android with a CANN device, the `Device` is still
@@ -534,6 +535,83 @@ fn query_device_memory(device: &Device) -> usize {
             }
             4 * 1024 * 1024 * 1024
         }
+    }
+}
+
+/// Query the free CUDA memory via `cuMemGetInfo_v2` through dlopen.
+///
+/// Returns `Some(free_bytes)` when the CUDA runtime library is available and
+/// the query succeeds, or `None` otherwise (allowing the caller to fall back
+/// to `total_mem`).
+///
+/// Calling `cuMemGetInfo_v2` after model weights are loaded gives the actual
+/// free VRAM available for KV cache blocks, which is what the paged-attention
+/// fraction should be relative to.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+fn query_cuda_free_memory() -> Option<usize> {
+    use std::ffi::CString;
+
+    // `cuMemGetInfo_v2(size_t *free, size_t *total)` → CUresult (i32).
+    type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+    const CUDA_SUCCESS: i32 = 0;
+
+    let lib_name = CString::new("libcuda.so.1").ok()?;
+    // SAFETY: dlopen with RTLD_LAZY | RTLD_LOCAL.
+    let handle = unsafe { libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        // Try without the version suffix.
+        let lib_name2 = CString::new("libcuda.so").ok()?;
+        let handle2 =
+            unsafe { libc::dlopen(lib_name2.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+        if handle2.is_null() {
+            return None;
+        }
+        return query_cuda_free_memory_handle(handle2);
+    }
+    query_cuda_free_memory_handle(handle)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+fn query_cuda_free_memory_handle(handle: *mut libc::c_void) -> Option<usize> {
+    use std::ffi::CString;
+
+    type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+    const CUDA_SUCCESS: i32 = 0;
+
+    let sym_name = CString::new("cuMemGetInfo_v2").ok()?;
+    // SAFETY: handle is non-null.
+    let sym_ptr = unsafe { libc::dlsym(handle, sym_name.as_ptr()) };
+    if sym_ptr.is_null() {
+        unsafe { libc::dlclose(handle) };
+        return None;
+    }
+    // SAFETY: verified symbol exists; transmute to known signature.
+    let cu_mem_get_info: CuMemGetInfo = unsafe { std::mem::transmute(sym_ptr) };
+    let mut free_bytes: usize = 0;
+    let mut total_bytes: usize = 0;
+    // SAFETY: stack-allocated pointers, valid for the duration of the call.
+    let result = unsafe { cu_mem_get_info(&mut free_bytes, &mut total_bytes) };
+    unsafe { libc::dlclose(handle) };
+
+    if result != CUDA_SUCCESS || free_bytes == 0 {
+        tracing::debug!(
+            "cuMemGetInfo_v2 returned {result} (free={free_bytes}, total={total_bytes}); \
+             falling back to total_mem"
+        );
+        None
+    } else {
+        tracing::debug!(
+            "CUDA memory: free={:.2} GiB, total={:.2} GiB",
+            free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+        Some(free_bytes)
     }
 }
 
