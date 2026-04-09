@@ -214,6 +214,19 @@ pub struct AudioEmbedContext {
     pub audio_token_id: u32,
 }
 
+/// Vision (image) input pending encoding on the engine thread.
+pub struct ImageEmbedContext {
+    /// Pre-patchified pixel values: shape `[N_patches, patch_pixels]` (f32 in [0,1]).
+    /// The engine thread calls `model.encode_image(...)` before prefill.
+    pub pixel_values: candle_core::Tensor,
+    /// Patch (x,y) grid coordinates: shape `[N_patches, 2]` (i64).
+    pub position_ids: candle_core::Tensor,
+    /// Number of output soft tokens this image should produce.
+    pub n_soft_tokens: usize,
+    /// Token ID for `<|image|>` soft tokens; used to locate injection positions.
+    pub image_token_id: u32,
+}
+
 /// Request to the engine (async/tokio version, used by the HTTP server).
 pub enum EngineRequest {
     /// Generate tokens for a chat completion.
@@ -221,6 +234,7 @@ pub enum EngineRequest {
         request_id: String,
         prompt_tokens: Vec<u32>,
         audio: Option<AudioEmbedContext>,
+        image: Option<ImageEmbedContext>,
         sampling_params: SamplingParams,
         response_tx: oneshot::Sender<GenerationResult>,
     },
@@ -233,6 +247,7 @@ pub enum EngineRequest {
         request_id: String,
         prompt_tokens: Vec<u32>,
         audio: Option<AudioEmbedContext>,
+        image: Option<ImageEmbedContext>,
         sampling_params: SamplingParams,
         output_buf: OutputBuffer,
     },
@@ -245,6 +260,7 @@ pub enum SyncEngineRequest {
         request_id: String,
         prompt_tokens: Vec<u32>,
         audio: Option<AudioEmbedContext>,
+        image: Option<ImageEmbedContext>,
         sampling_params: SamplingParams,
         token_tx: std::sync::mpsc::SyncSender<StreamToken>,
     },
@@ -465,6 +481,8 @@ struct ActiveSequence {
     sink: TokenSink,
     /// Pending audio context to be prepared before the first prefill.
     audio: Option<AudioEmbedContext>,
+    /// Pending image context to be prepared before the first prefill.
+    image: Option<ImageEmbedContext>,
     /// Per-sequence block table for paged attention.
     /// `None` when running without paged attention.
     block_table: Option<BlockTable>,
@@ -489,6 +507,7 @@ impl ActiveSequence {
                 request_id,
                 prompt_tokens,
                 audio,
+                image,
                 sampling_params,
                 response_tx,
             } => {
@@ -500,6 +519,7 @@ impl ActiveSequence {
                     all_tokens,
                     sampling_params,
                     audio,
+                    image,
                     sink: TokenSink::OneShot(Some(response_tx)),
                     block_table: block_size.map(BlockTable::new),
                     prefilled: false,
@@ -511,6 +531,7 @@ impl ActiveSequence {
                 request_id,
                 prompt_tokens,
                 audio,
+                image,
                 sampling_params,
                 output_buf,
             } => {
@@ -522,6 +543,7 @@ impl ActiveSequence {
                     all_tokens,
                     sampling_params,
                     audio,
+                    image,
                     sink: TokenSink::Streaming {
                         request_id,
                         output_buf,
@@ -1237,6 +1259,18 @@ impl Engine {
                             continue;
                         }
                     }
+                    // Prepare image embeddings before the first prefill.
+                    if let Some(image_ctx) = seq.image.take() {
+                        if let Err(e) = Self::cb_prepare_image(
+                            &mut model,
+                            &device,
+                            &seq.prompt_tokens,
+                            image_ctx,
+                        ) {
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                            continue;
+                        }
+                    }
                 }
 
                 let logits_result = if !seq.prefilled {
@@ -1403,6 +1437,47 @@ impl Engine {
         Ok(())
     }
 
+    /// Encode vision (image) embeddings and register them with the model.
+    ///
+    /// Finds all positions in `prompt_tokens` that match `ctx.image_token_id`,
+    /// encodes the pixel patches via the model's vision tower, then stores
+    /// (embeddings, positions) so that the next `forward()` call injects them.
+    fn cb_prepare_image(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        prompt_tokens: &[u32],
+        ctx: ImageEmbedContext,
+    ) -> Result<()> {
+        let pixel_values = ctx.pixel_values.to_device(device)?;
+        let position_ids = ctx.position_ids.to_device(device)?;
+        let embeds = model.encode_image(&pixel_values, &position_ids, ctx.n_soft_tokens)?;
+        let positions: Vec<usize> = prompt_tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| {
+                if id == ctx.image_token_id {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if positions.is_empty() {
+            tracing::warn!(
+                "Vision encoder produced {} embeddings but no <|image|> tokens found in prompt",
+                embeds.dim(0)?
+            );
+        }
+        tracing::info!(
+            "Vision: encoded {} embeddings, found {} <|image|> positions (token_id={})",
+            embeds.dim(0).unwrap_or(0),
+            positions.len(),
+            ctx.image_token_id,
+        );
+        model.set_pending_image(embeds, positions);
+        Ok(())
+    }
+
     ///
     /// When paged attention is active, uses "hybrid prefill": run the fast
     /// non-paged `forward` for the prompt (avoids per-layer scatter overhead),
@@ -1504,6 +1579,7 @@ impl Engine {
                     request_id,
                     prompt_tokens,
                     audio,
+                    image: _image,
                     sampling_params,
                     token_tx,
                 } => {

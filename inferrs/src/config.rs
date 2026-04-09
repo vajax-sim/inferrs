@@ -65,6 +65,43 @@ pub struct TextConfig {
     pub attention_k_eq_v: Option<bool>,
 }
 
+/// Vision encoder configuration from `vision_config` in `config.json`.
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct VisionConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    #[serde(default = "default_vision_head_dim")]
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub patch_size: usize,
+    pub pooling_kernel_size: usize,
+    pub default_output_length: usize,
+    pub position_embedding_size: usize,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f64,
+    #[serde(default = "default_vision_rope_theta")]
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub use_clipped_linears: bool,
+    #[serde(default)]
+    pub standardize: bool,
+    #[serde(default = "default_vision_hidden_activation")]
+    pub hidden_activation: String,
+}
+
+fn default_vision_head_dim() -> usize {
+    64
+}
+fn default_vision_rope_theta() -> f64 {
+    100.0
+}
+fn default_vision_hidden_activation() -> String {
+    "gelu_pytorch_tanh".to_string()
+}
+
 /// Audio encoder configuration from `audio_config` in `config.json`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AudioConfig {
@@ -162,6 +199,10 @@ pub struct RawConfig {
     // Gemma4 multimodal
     pub audio_config: Option<AudioConfig>,
     pub audio_token_id: Option<u32>,
+    pub vision_config: Option<VisionConfig>,
+    pub image_token_id: Option<u32>,
+    pub boi_token_id: Option<u32>,
+    pub eoi_token_id: Option<u32>,
 }
 
 /// Default epsilon for RMS normalization layers across all model families.
@@ -682,6 +723,10 @@ mod tests {
             text_config: None,
             audio_config: None,
             audio_token_id: None,
+            vision_config: None,
+            image_token_id: None,
+            boi_token_id: None,
+            eoi_token_id: None,
         }
     }
 

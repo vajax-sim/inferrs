@@ -474,6 +474,7 @@ fn stream_response_collect(
         request_id,
         prompt_tokens,
         audio,
+        image: None,
         sampling_params: sampling_params.clone(),
         token_tx,
     })?;
