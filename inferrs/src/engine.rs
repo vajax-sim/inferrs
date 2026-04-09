@@ -488,17 +488,40 @@ fn check_stop(
     None
 }
 
-/// Query the free memory available on `device` after model weights are loaded.
+/// Query the memory baseline for paged-attention block allocation.
 ///
-/// Each backend uses its own native API so that `--paged-attention=<fraction>`
-/// is relative to the **free** memory available for KV blocks, not total memory.
-/// Using free memory ensures the KV block allocation fits in VRAM after the
-/// model weights have already been loaded.
+/// The returned value is used as the denominator in:
+///   `kv_cache_bytes = returned_bytes × paged_attention_fraction`
 ///
-/// * **Metal** – `MTLDevice.recommendedMaxWorkingSetSize` (Apple Silicon).
-/// * **CUDA**  – `cuMemGetInfo` via cudarc runtime, returning free bytes.
-/// * **CANN**  – `aclrtGetMemInfo(ACL_HBM_MEM, &free, &total)` via dlopen.
-/// * **CPU**   – 4 GiB conservative fallback.
+/// This mirrors vllm's `--gpu-memory-utilization` semantics exactly:
+///   `requested = total_memory × utilization`
+///
+/// ## Per-backend behaviour
+///
+/// ### Discrete CUDA GPU (e.g. H100, A100)
+/// Returns `total_memory` from `cuMemGetInfo_v2`.  This matches vllm:
+/// the fraction covers total VRAM and the model weights are subtracted
+/// when the block pool is sized (the remaining free memory after weights
+/// are already allocated constrains what the pool can actually hold).
+///
+/// ### UMA / shared-memory GPU (SM 12.1 = DGX Spark GB10)
+/// On these platforms CPU and GPU share the same physical DRAM.
+/// `cuMemGetInfo_v2` reports total system memory, not a separate GPU pool.
+/// vllm detects this (SM capability in {(8,7),(11,0),(12,1)}) and substitutes
+/// `psutil.virtual_memory().available` for the free baseline while keeping
+/// `total_memory` from CUDA.  We do the same: read `/proc/meminfo` for
+/// available system RAM and use that as the baseline so that the fraction is
+/// relative to memory that can actually be allocated.
+///
+/// ### Metal (Apple Silicon)
+/// `MTLDevice.recommendedMaxWorkingSetSize` — the OS-reported upper bound
+/// for the GPU working set on unified memory.
+///
+/// ### CANN (Huawei Ascend)
+/// `aclrtGetMemInfo(ACL_HBM_MEM)` via dlopen — total HBM.
+///
+/// ### CPU fallback
+/// 4 GiB conservative heuristic.
 fn query_device_memory(device: &Device) -> usize {
     match device {
         #[cfg(target_os = "macos")]
@@ -507,22 +530,47 @@ fn query_device_memory(device: &Device) -> usize {
             target_os = "linux",
             all(target_os = "windows", target_arch = "x86_64")
         ))]
-        Device::Cuda(_cuda_dev) => {
-            // Use cuMemGetInfo_v2 to get free memory after model weights are loaded.
-            // This is the correct baseline for --paged-attention=<fraction>: the
-            // fraction should be relative to what is actually free, not total VRAM.
-            // Using total_mem() would try to allocate >100% of VRAM when the model
-            // weights already occupy a significant fraction (e.g. 62 GB of 128 GB).
-            query_cuda_free_memory().unwrap_or_else(|| {
-                // Fall back to total memory if free-memory query fails.
-                match _cuda_dev.cuda_stream().context().total_mem() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!("Failed to query CUDA memory ({e}); falling back to 8 GiB");
-                        8 * 1024 * 1024 * 1024
-                    }
-                }
-            })
+        Device::Cuda(cuda_dev) => {
+            // Query total and free from cuMemGetInfo_v2, then decide which to use.
+            let (free_bytes, total_bytes) = query_cuda_mem_info().unwrap_or_else(|| {
+                let total = cuda_dev
+                    .cuda_stream()
+                    .context()
+                    .total_mem()
+                    .unwrap_or(8 * 1024 * 1024 * 1024);
+                (total, total) // can't distinguish free/total; fall back to total
+            });
+
+            // Detect UMA / shared-memory GPU platforms (SM 12.1 = DGX Spark,
+            // SM 11.0 = Thor, SM 8.7 = Orin).  On these devices cudaMemGetInfo
+            // reports system memory, not a separate GPU pool, so the "total"
+            // value equals total system RAM.  vllm mirrors this by using
+            // psutil.virtual_memory().available as the free baseline on these
+            // platforms.  We read /proc/meminfo for the same value.
+            let is_uma = is_cuda_uma_platform(cuda_dev);
+            if is_uma {
+                // On UMA platforms match vllm: use available system RAM.
+                let sys_available = read_proc_meminfo_available_kb()
+                    .map(|kb| kb * 1024)
+                    .unwrap_or(free_bytes); // fall back to CUDA free if /proc unavailable
+                tracing::info!(
+                    "UMA platform detected (shared CPU/GPU memory): \
+                     using system available RAM {:.2} GiB as KV cache baseline \
+                     (total CUDA memory: {:.2} GiB)",
+                    sys_available as f64 / (1024.0 * 1024.0 * 1024.0),
+                    total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+                sys_available
+            } else {
+                // Discrete GPU: use total CUDA memory, matching vllm's
+                // `requested = total × utilization` formula.
+                tracing::info!(
+                    "CUDA memory: total={:.2} GiB, free={:.2} GiB",
+                    total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                );
+                total_bytes
+            }
         }
         _ => {
             // On Linux/Android with a CANN device, the `Device` is still
@@ -538,81 +586,152 @@ fn query_device_memory(device: &Device) -> usize {
     }
 }
 
-/// Query the free CUDA memory via `cuMemGetInfo_v2` through dlopen.
-///
-/// Returns `Some(free_bytes)` when the CUDA runtime library is available and
-/// the query succeeds, or `None` otherwise (allowing the caller to fall back
-/// to `total_mem`).
-///
-/// Calling `cuMemGetInfo_v2` after model weights are loaded gives the actual
-/// free VRAM available for KV cache blocks, which is what the paged-attention
-/// fraction should be relative to.
+/// Query `cuMemGetInfo_v2` via dlopen and return `Some((free, total))`.
 #[cfg(any(
     target_os = "linux",
     all(target_os = "windows", target_arch = "x86_64")
 ))]
-fn query_cuda_free_memory() -> Option<usize> {
+fn query_cuda_mem_info() -> Option<(usize, usize)> {
     use std::ffi::CString;
-
-    // `cuMemGetInfo_v2(size_t *free, size_t *total)` → CUresult (i32).
     type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
-    const CUDA_SUCCESS: i32 = 0;
 
-    let lib_name = CString::new("libcuda.so.1").ok()?;
-    // SAFETY: dlopen with RTLD_LAZY | RTLD_LOCAL.
+    let handle = {
+        let name1 = CString::new("libcuda.so.1").ok()?;
+        let h = unsafe { libc::dlopen(name1.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+        if h.is_null() {
+            let name2 = CString::new("libcuda.so").ok()?;
+            let h2 = unsafe { libc::dlopen(name2.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+            if h2.is_null() {
+                return None;
+            }
+            h2
+        } else {
+            h
+        }
+    };
+
+    let sym_name = CString::new("cuMemGetInfo_v2").ok()?;
+    let sym_ptr = unsafe { libc::dlsym(handle, sym_name.as_ptr()) };
+    if sym_ptr.is_null() {
+        unsafe { libc::dlclose(handle) };
+        return None;
+    }
+    let cu_mem_get_info: CuMemGetInfo = unsafe { std::mem::transmute(sym_ptr) };
+    let mut free_bytes: usize = 0;
+    let mut total_bytes: usize = 0;
+    let result = unsafe { cu_mem_get_info(&mut free_bytes, &mut total_bytes) };
+    unsafe { libc::dlclose(handle) };
+
+    if result != 0 || total_bytes == 0 {
+        None
+    } else {
+        Some((free_bytes, total_bytes))
+    }
+}
+
+/// Return `true` when the CUDA device is a UMA / shared-memory platform
+/// (DGX Spark SM 12.1, Thor SM 11.0, Orin SM 8.7) where CPU and GPU share
+/// the same physical memory pool.
+///
+/// On these platforms `cuMemGetInfo` reports system RAM, not a separate GPU
+/// pool.  vllm detects these by SM capability and substitutes
+/// `psutil.virtual_memory().available` for the free-memory baseline.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+fn is_cuda_uma_platform(_cuda_dev: &candle_core::CudaDevice) -> bool {
+    use std::ffi::CString;
+    let lib_name = CString::new("libcuda.so.1")
+        .or_else(|_| CString::new("libcuda.so"))
+        .ok();
+    let Some(lib_name) = lib_name else {
+        return false;
+    };
     let handle = unsafe { libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if handle.is_null() {
-        // Try without the version suffix.
-        let lib_name2 = CString::new("libcuda.so").ok()?;
-        let handle2 =
-            unsafe { libc::dlopen(lib_name2.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
-        if handle2.is_null() {
-            return None;
+        let name2 = CString::new("libcuda.so").ok();
+        let Some(name2) = name2 else { return false };
+        let h2 = unsafe { libc::dlopen(name2.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+        if h2.is_null() {
+            return false;
         }
-        return query_cuda_free_memory_handle(handle2);
+        return is_cuda_uma_platform_handle(h2);
     }
-    query_cuda_free_memory_handle(handle)
+    is_cuda_uma_platform_handle(handle)
 }
 
 #[cfg(any(
     target_os = "linux",
     all(target_os = "windows", target_arch = "x86_64")
 ))]
-fn query_cuda_free_memory_handle(handle: *mut libc::c_void) -> Option<usize> {
+fn is_cuda_uma_platform_handle(handle: *mut libc::c_void) -> bool {
     use std::ffi::CString;
+    type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
-    type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
-    const CUDA_SUCCESS: i32 = 0;
-
-    let sym_name = CString::new("cuMemGetInfo_v2").ok()?;
-    // SAFETY: handle is non-null.
-    let sym_ptr = unsafe { libc::dlsym(handle, sym_name.as_ptr()) };
+    let sym = CString::new("cuDeviceGetAttribute").ok();
+    let Some(sym) = sym else {
+        unsafe { libc::dlclose(handle) };
+        return false;
+    };
+    let sym_ptr = unsafe { libc::dlsym(handle, sym.as_ptr()) };
     if sym_ptr.is_null() {
         unsafe { libc::dlclose(handle) };
-        return None;
+        return false;
     }
-    // SAFETY: verified symbol exists; transmute to known signature.
-    let cu_mem_get_info: CuMemGetInfo = unsafe { std::mem::transmute(sym_ptr) };
-    let mut free_bytes: usize = 0;
-    let mut total_bytes: usize = 0;
-    // SAFETY: stack-allocated pointers, valid for the duration of the call.
-    let result = unsafe { cu_mem_get_info(&mut free_bytes, &mut total_bytes) };
+    let get_attr: CuDeviceGetAttribute = unsafe { std::mem::transmute(sym_ptr) };
+
+    // inferrs always uses device 0 (single-GPU).
+    let ordinal: i32 = 0;
+
+    let mut major: i32 = 0;
+    let mut minor: i32 = 0;
+    let r1 = unsafe {
+        get_attr(
+            &mut major,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            ordinal,
+        )
+    };
+    let r2 = unsafe {
+        get_attr(
+            &mut minor,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            ordinal,
+        )
+    };
     unsafe { libc::dlclose(handle) };
 
-    if result != CUDA_SUCCESS || free_bytes == 0 {
-        tracing::debug!(
-            "cuMemGetInfo_v2 returned {result} (free={free_bytes}, total={total_bytes}); \
-             falling back to total_mem"
-        );
-        None
-    } else {
-        tracing::debug!(
-            "CUDA memory: free={:.2} GiB, total={:.2} GiB",
-            free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-        Some(free_bytes)
+    if r1 != 0 || r2 != 0 {
+        return false;
     }
+
+    // UMA platforms identified by vllm: (8,7)=Orin, (11,0)=Thor, (12,1)=Spark
+    matches!((major, minor), (8, 7) | (11, 0) | (12, 1))
+}
+
+/// Read `MemAvailable` from `/proc/meminfo` and return it in kibibytes.
+/// Returns `None` on any error (non-Linux, parse failure, etc.).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "windows", target_arch = "x86_64"),
+))]
+fn read_proc_meminfo_available_kb() -> Option<usize> {
+    // /proc/meminfo only exists on Linux/Android; Windows returns None.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb);
+            }
+        }
+    }
+    None
 }
 
 /// Attempt to query total HBM memory from the CANN runtime via `dlopen`.
@@ -726,13 +845,12 @@ pub fn attach_paged_kv_if_requested(
         _ => 2, // f16 / bf16
     };
 
-    // Query free device memory after model weights are loaded so that
-    // `memory_fraction` is relative to what is actually available for KV
-    // blocks.  Using total memory would try to allocate more than what is
-    // free when the model weights already occupy a large fraction of VRAM.
+    // Query the memory baseline for KV cache sizing.  The semantics mirror
+    // vllm's --gpu-memory-utilization: fraction × baseline = KV cache bytes.
+    // See `query_device_memory` for per-backend details.
     let total_memory_bytes: usize = query_device_memory(device);
     tracing::info!(
-        "Device free memory (post model load): {:.2} GiB",
+        "Paged attention memory baseline: {:.2} GiB",
         total_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
