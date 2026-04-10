@@ -1,0 +1,42 @@
+name: GPU CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gpu-test:
+    name: CUDA tests (nvidia-runner-1)
+    runs-on: [self-hosted, Linux, X64, cuda]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu-ci
+
+      - name: Show GPU info
+        run: nvidia-smi
+
+      - name: Build (with CUDA backend)
+        run: cargo build -p inferrs -p inferrs-backend-cuda
+
+      - name: Run unit tests
+        run: cargo test -p inferrs -p inferrs-backend-cuda
+
+      - name: Run integration tests (ignored, require GPU + model)
+        run: cargo test -p inferrs --test server_integration -- --ignored --nocapture --test-threads=1
+        env:
+          # HuggingFace Hub caches models in ~/.cache/huggingface by default.
+          # On a self-hosted runner this persists between runs, so model
+          # downloads only happen once.
+          HF_HOME: /home/runner/.cache/huggingface
