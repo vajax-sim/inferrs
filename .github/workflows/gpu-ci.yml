@@ -49,27 +49,20 @@ jobs:
       - name: Show GPU info
         run: nvidia-smi
 
-      # candle-kernels unconditionally compiles WMMA (Tensor Core) CUDA
-      # kernels which require SM 7.0+.  The runner's Pascal GPU is SM 6.1,
-      # so auto-detection would produce a build that fails to compile.
-      # Force SM 8.0 (Ampere) for compilation — the resulting PTX is
-      # forward-compatible, and inferrs avoids unsupported code paths at
-      # runtime via feature detection.
+      # Let bindgen_cuda auto-detect the GPU's compute capability via
+      # nvidia-smi.  The WMMA .cu files now compile to no-op stubs on
+      # SM < 7.0 (via INFERRS_NO_WMMA), so this works on Pascal (6.1)
+      # as well as Volta+ GPUs.
       - name: Build (with CUDA backend)
         run: cargo build -p inferrs -p inferrs-backend-cuda
-        env:
-          CUDA_COMPUTE_CAP: "80"
 
       - name: Run unit tests
         run: cargo test -p inferrs -p inferrs-backend-cuda
-        env:
-          CUDA_COMPUTE_CAP: "80"
 
       - name: Run integration tests (ignored, require GPU + model)
         run: cargo test -p inferrs --test server_integration -- --ignored --nocapture --test-threads=1
         continue-on-error: true
         env:
-          CUDA_COMPUTE_CAP: "80"
           # HuggingFace Hub caches models in ~/.cache/huggingface by default.
           # On a self-hosted runner this persists between runs, so model
           # downloads only happen once.

@@ -8,6 +8,25 @@
  *
  * Adapted from: https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_wmma_gguf.cu
  */
+
+// WMMA (Tensor Core) intrinsics require SM 7.0+ (Volta and later).
+// On older GPUs the build system defines INFERRS_NO_WMMA and this file
+// compiles to a no-op stub so the library still links.
+#ifdef INFERRS_NO_WMMA
+
+#include <cuda_runtime.h>
+#include <cstdint>
+
+extern "C" void moe_gemm_gguf_prefill(
+    const void*, const uint8_t*, const int32_t*, const int32_t*,
+    const float*, float*,
+    int, int, int, int, int, int, int, cudaStream_t
+) {
+    // No-op: WMMA not available on this GPU architecture.
+}
+
+#else // INFERRS_NO_WMMA
+
 #include "gguf.cuh"
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -420,3 +439,5 @@ extern "C" void moe_gemm_gguf_prefill(
     cudaFreeAsync(expert_counts, stream);
     cudaFreeAsync(expert_offsets, stream);
 }
+
+#endif // INFERRS_NO_WMMA

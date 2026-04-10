@@ -3,7 +3,7 @@
  *
  *  Each block computes a tile of the output corresponding to:
  *    - One expert segment (group of tokens routed to the same expert)
- *    - One N-dimension tile (a sub-block of the expert's output features)
+ *    - One N-dimension tile (a sub-block of the expert’s output features)
  *
  *  The kernel loads input activations and expert weights in tiles using shared memory,
  *  performs matrix multiplication using Tensor Cores (WMMA), and accumulates results
@@ -13,6 +13,24 @@
  *
  *  Adapted from https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_gemm_wmma.cu
  */
+
+// WMMA (Tensor Core) intrinsics require SM 7.0+ (Volta and later).
+// On older GPUs the build system defines INFERRS_NO_WMMA and this file
+// compiles to a no-op stub so the library still links.
+#ifdef INFERRS_NO_WMMA
+
+#include <cuda_runtime.h>
+#include <cstdint>
+
+extern "C" void moe_gemm_wmma(
+    const void*, const void*, const int32_t*, const int32_t*,
+    const float*, void*, int32_t*, int32_t*,
+    int, int, int, int, int, int, bool, cudaStream_t
+) {
+    // No-op: WMMA not available on this GPU architecture.
+}
+
+#else // INFERRS_NO_WMMA
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -282,3 +300,5 @@ extern "C" void moe_gemm_wmma(
         }
     }
 }
+
+#endif // INFERRS_NO_WMMA

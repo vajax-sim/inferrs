@@ -20,10 +20,24 @@ fn main() {
     // Remove unwanted MOE PTX constants from ptx.rs
     remove_lines(&ptx_path, &["MOE_GGUF", "MOE_WMMA", "MOE_WMMA_GGUF"]);
 
+    // WMMA (Tensor Core) intrinsics require SM 7.0+ (Volta).  When targeting
+    // older architectures (e.g. Pascal SM 6.x), pass -DINFERRS_NO_WMMA so the
+    // WMMA .cu files compile to no-op stubs instead of hitting undefined
+    // identifier errors for the nvcuda::wmma namespace.
+    let compute_cap: u32 = env::var("CUDA_COMPUTE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80);
+    let has_wmma = compute_cap >= 70;
+
     let mut moe_builder = bindgen_cuda::Builder::default()
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");
+
+    if !has_wmma {
+        moe_builder = moe_builder.arg("-DINFERRS_NO_WMMA");
+    }
 
     // Build for FFI binding (must use custom bindgen_cuda, which supports simutanously build PTX and lib)
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
