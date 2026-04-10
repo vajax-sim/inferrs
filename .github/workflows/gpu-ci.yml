@@ -34,10 +34,11 @@ jobs:
               echo "CUDA_PATH=$d" >> "$GITHUB_ENV"
               echo "LIBRARY_PATH=$d/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
               echo "LD_LIBRARY_PATH=$d/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+              NVCC="$d/bin/nvcc"
               break
             fi
           done
-          nvcc --version
+          "${NVCC:-nvcc}" --version
 
       - uses: dtolnay/rust-toolchain@stable
 
