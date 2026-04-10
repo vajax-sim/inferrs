@@ -24,6 +24,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev
 
+      - name: Set up CUDA environment
+        run: |
+          # Find the CUDA installation (common paths on self-hosted runners)
+          for d in /usr/local/cuda /opt/cuda /usr; do
+            if [ -x "$d/bin/nvcc" ]; then
+              echo "Found CUDA at $d"
+              echo "$d/bin" >> "$GITHUB_PATH"
+              echo "CUDA_PATH=$d" >> "$GITHUB_ENV"
+              echo "LIBRARY_PATH=$d/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+              echo "LD_LIBRARY_PATH=$d/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          nvcc --version
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
