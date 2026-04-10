@@ -63,7 +63,6 @@ jobs:
         run: cargo test -p inferrs --test server_integration -- --ignored --nocapture --test-threads=1
         continue-on-error: true
         env:
-          # HuggingFace Hub caches models in ~/.cache/huggingface by default.
-          # On a self-hosted runner this persists between runs, so model
-          # downloads only happen once.
-          HF_HOME: /home/runner/.cache/huggingface
+          # HuggingFace Hub caches models under ~/.cache/huggingface by
+          # default.  On self-hosted runners the cache persists between
+          # runs so model downloads only happen once.
