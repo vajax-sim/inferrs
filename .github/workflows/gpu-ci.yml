@@ -59,10 +59,9 @@ jobs:
       - name: Run unit tests
         run: cargo test -p inferrs -p inferrs-backend-cuda
 
+      # HuggingFace Hub caches models under ~/.cache/huggingface by default.
+      # On the self-hosted runner this cache persists between runs so the
+      # model is only downloaded once.
       - name: Run integration tests (ignored, require GPU + model)
         run: cargo test -p inferrs --test server_integration -- --ignored --nocapture --test-threads=1
         continue-on-error: true
-        env:
-          # HuggingFace Hub caches models under ~/.cache/huggingface by
-          # default.  On self-hosted runners the cache persists between
-          # runs so model downloads only happen once.
