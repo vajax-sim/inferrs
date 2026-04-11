@@ -37,26 +37,37 @@ __device__ double atomicAdd(double* address, double val) {
 
 #if __CUDA_ARCH__ < 700
 // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#atomicadd
-// The 16-bit __half floating-point version of atomicAdd() is only supported by devices of compute capability 7.x and higher.
+// The 16-bit __half floating-point version of atomicAdd() is only supported
+// by devices of compute capability 7.x and higher. On Pascal (SM 6.x) we
+// fall back to a 32-bit atomicCAS loop that reads the enclosing 4-byte
+// word, modifies the target half, and CAS-writes it back. This mirrors the
+// existing atomicMaxf/atomicMinf half shims below.
 // Solution adapted from https://github.com/torch/cutorch/blob/master/lib/THC/THCAtomics.cuh#L96-L119
-//__device__ __half atomicAdd(__half *address, __half val) {
-   //  unsigned int *address_as_ui = (unsigned int *) ((char *)address - ((size_t)address & 2));
-   //  unsigned int old = *address_as_ui;
-   //  unsigned int assumed;
-   //  bool unaligned = (size_t) address & 2;
-   //  do {
-   //      assumed = old;
-   //      unsigned int hsum;
-   //      hsum = unaligned ? (old >> 16) : (old & 0xffff);
-   //      hsum = __half_as_ushort(__ushort_as_half(hsum) + val); 
-   //      old = atomicCAS(address_as_ui, assumed,
-   //          unaligned ? (old & 0xffff) | (hsum << 16) : (old & 0xffff0000) | hsum
-   //      );
-
-   // } while (assumed != old);
-   // return __ushort_as_half(unaligned ? (old >> 16) : (old & 0xffff));
-//}
+__device__ __forceinline__ __half atomicAdd(__half *address, __half val) {
+    unsigned int *address_as_ui =
+        (unsigned int *) ((char *)address - ((size_t)address & 2));
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+    bool unaligned = (size_t) address & 2;
+    do {
+        assumed = old;
+        unsigned int hsum;
+        hsum = unaligned ? (old >> 16) : (old & 0xffff);
+        hsum = __half_as_ushort(__ushort_as_half(hsum) + val);
+        old = atomicCAS(address_as_ui, assumed,
+            unaligned ? (old & 0xffff) | (hsum << 16)
+                      : (old & 0xffff0000) | hsum
+        );
+    } while (assumed != old);
+    return __ushort_as_half(unaligned ? (old >> 16) : (old & 0xffff));
+}
 #endif
+
+// Note: no bfloat16 atomicAdd shim is required — reduce.cu only
+// instantiates SUM_OP(__nv_bfloat16, ...) inside `#if __CUDA_ARCH__ >= 800`
+// (see src/reduce.cu around line 650), which is precisely where CUDA's
+// native `atomicAdd(__nv_bfloat16*, __nv_bfloat16)` exists. On older arches
+// the bf16 sum kernel simply isn't compiled.
 
 
 __device__ __forceinline__ __half atomicMaxf(__half* address, __half val) {
