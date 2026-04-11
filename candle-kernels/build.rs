@@ -3,12 +3,23 @@ use std::path::PathBuf;
 
 /// Default WMMA target arch when the user doesn't override `INFERRS_WMMA_ARCH`.
 ///
-/// We pick `70` (Volta) so that compute_70 PTX embedded in the WMMA lib JITs
-/// forward to every Tensor-Core arch in production today (V100, T4, A100,
-/// L4, H100, B200, ...). PTX cannot JIT *backwards*, so picking 75 here
-/// would silently break V100. Users who only care about Turing+ can set
-/// `INFERRS_WMMA_ARCH=75` (or higher) for marginally better SASS.
-const DEFAULT_WMMA_ARCH: usize = 70;
+/// We pick `80` (Ampere) because `moe_wmma.cu` instantiates WMMA fragments
+/// for *both* `__half` and `nv_bfloat16`. Half-precision WMMA is available
+/// from sm_70 (Volta), but bf16 WMMA fragments require sm_80+ — on Turing
+/// or Volta the bf16 `fragment<matrix_a, ..., nv_bfloat16, ...>` template
+/// is an incomplete type and the kernel fails to compile.
+///
+/// Note that `bindgen_cuda::Builder::build_lib` compiles directly to SASS
+/// (`--gpu-architecture=sm_XX`) and does *not* embed a PTX fatbin layer,
+/// so the cubin only runs on the exact arch it was built for — there is
+/// no forward JIT. The Rust runtime gate in `candle-nn/src/moe.rs` refuses
+/// to launch the WMMA kernels on GPUs below this arch, so the host-side
+/// wrapper stays linked but the device code is never loaded on pre-Ampere
+/// hardware.
+///
+/// Users targeting Hopper or Blackwell exclusively can set
+/// `INFERRS_WMMA_ARCH=90` (or higher) for slightly better SASS.
+const DEFAULT_WMMA_ARCH: usize = 80;
 
 /// Top-level (non-MoE) kernels that go through the PTX build path.
 const NON_MOE_KERNELS: &[&str] = &[

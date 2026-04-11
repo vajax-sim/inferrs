@@ -14,13 +14,16 @@
  *  Adapted from https://github.com/guoqingbao/attention.rs/tree/main/src/kernels/src/moe_gemm_wmma.cu
  */
 
-// WMMA (Tensor Core) intrinsics require SM 7.0+ (Volta and later).
+// WMMA Tensor Core intrinsics require SM 7.0+ (Volta) for half, and
+// SM 8.0+ (Ampere) for nv_bfloat16 fragments. This kernel instantiates
+// both dtypes, so the effective floor is Ampere.
+//
 // This file is compiled by a dedicated bindgen_cuda::Builder pinned to a
-// WMMA-capable compute capability (see candle-kernels/build.rs). The Rust
-// layer in candle-nn/src/moe.rs gates callers on `has_wmma_support()`,
-// which probes the active GPU's compute capability via the CUDA driver
-// API at runtime, so this kernel is only launched on hardware that can
-// run it.
+// WMMA-capable compute capability (default sm_80; see
+// candle-kernels/build.rs). The Rust layer in candle-nn/src/moe.rs gates
+// callers on `has_wmma_support()`, which probes the active GPU's compute
+// capability via the CUDA driver API at runtime, so this kernel is only
+// launched on hardware that can run it.
 
 #include <cuda.h>
 #include <cuda_runtime.h>

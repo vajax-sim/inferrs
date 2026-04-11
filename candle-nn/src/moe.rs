@@ -5,14 +5,20 @@ use candle::cuda_backend::kernels::ffi;
 use candle::quantized::{self, QTensor};
 use candle::{Result, Tensor};
 
-/// Returns `true` when the active CUDA device exposes Tensor Core (WMMA)
-/// instructions — i.e. compute capability >= 7.0 (Volta+).
+/// Returns `true` when the active CUDA device matches the build arch the
+/// WMMA MoE kernels were compiled against (default sm_80, Ampere+).
 ///
-/// The WMMA MoE kernels (`moe_wmma.cu`, `moe_wmma_gguf.cu`) are compiled
-/// against `sm_70` PTX in `candle-kernels/build.rs`. On older GPUs (Pascal
-/// SM 6.x and earlier) those kernels cannot be loaded by the driver, so the
-/// Rust callers below gate every WMMA FFI call on this probe and return a
-/// descriptive error instead of segfaulting inside the cubin loader.
+/// The WMMA MoE kernels (`moe_wmma.cu`, `moe_wmma_gguf.cu`) instantiate
+/// `nvcuda::wmma::fragment<..., nv_bfloat16, ...>` templates that require
+/// compute capability 8.0 or higher (bf16 Tensor Cores landed in Ampere).
+/// Half-precision WMMA works from Volta, but we need both, so the kernels
+/// are compiled against sm_80 by default in `candle-kernels/build.rs`.
+/// Because `bindgen_cuda::Builder::build_lib` emits SASS without a PTX
+/// forward-JIT fallback, the cubin only runs on the exact arch it was
+/// built for — and on older GPUs (Turing, Volta, Pascal, …) the driver
+/// would fail at kernel-load time. This probe rejects those GPUs in Rust
+/// before we ever try to launch the kernel, so the caller sees a clean
+/// error instead of a segfault in the cubin loader.
 ///
 /// We dlopen `libcuda.so` directly rather than going through `cudarc`
 /// because the CUDA driver API exposes `cuDeviceGetAttribute` for compute
@@ -65,7 +71,8 @@ fn probe_wmma_support() -> bool {
     if r != 0 {
         return false;
     }
-    major >= 7
+    // Must match DEFAULT_WMMA_ARCH in candle-kernels/build.rs (Ampere+).
+    major >= 8
 }
 
 #[cfg(feature = "cuda")]
@@ -107,9 +114,10 @@ pub fn moe_gemm(
         let dev = input.device().as_cuda_device()?;
         if !has_wmma_support(dev) {
             candle::bail!(
-                "moe_gemm requires a CUDA device with Tensor Core support \
-                 (compute capability >= 7.0); the active GPU is pre-Volta. \
-                 MoE inference is not yet supported on this hardware."
+                "moe_gemm requires a CUDA device with bf16 Tensor Core \
+                 support (compute capability >= 8.0, i.e. Ampere or newer). \
+                 The active GPU is pre-Ampere; MoE inference is not yet \
+                 supported on this hardware."
             );
         }
         let data_type = match input.dtype() {
@@ -323,10 +331,11 @@ pub fn moe_gemm_gguf(
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
         if is_prefill && !has_wmma_support(dev) {
             candle::bail!(
-                "moe_gemm_gguf prefill requires a CUDA device with Tensor Core \
-                 support (compute capability >= 7.0); the active GPU is \
-                 pre-Volta. GGUF MoE prefill is not yet supported on this \
-                 hardware (decode still works)."
+                "moe_gemm_gguf prefill requires a CUDA device with bf16 \
+                 Tensor Core support (compute capability >= 8.0, i.e. \
+                 Ampere or newer). The active GPU is pre-Ampere; GGUF MoE \
+                 prefill is not yet supported on this hardware (decode \
+                 still works)."
             );
         }
         unsafe {
