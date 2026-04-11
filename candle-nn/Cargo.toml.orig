@@ -21,6 +21,7 @@ safetensors = { workspace = true }
 serde = { workspace = true }
 metal = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -32,7 +33,7 @@ criterion = { workspace = true }
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate"]
-cuda = ["candle/cuda"]
+cuda = ["candle/cuda", "dep:libloading"]
 mkl = ["dep:intel-mkl-src", "candle/mkl"]
 metal = ["candle/metal", "dep:candle-metal-kernels", "dep:metal"]
 

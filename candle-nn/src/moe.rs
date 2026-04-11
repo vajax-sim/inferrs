@@ -5,6 +5,69 @@ use candle::cuda_backend::kernels::ffi;
 use candle::quantized::{self, QTensor};
 use candle::{Result, Tensor};
 
+/// Returns `true` when the active CUDA device exposes Tensor Core (WMMA)
+/// instructions — i.e. compute capability >= 7.0 (Volta+).
+///
+/// The WMMA MoE kernels (`moe_wmma.cu`, `moe_wmma_gguf.cu`) are compiled
+/// against `sm_70` PTX in `candle-kernels/build.rs`. On older GPUs (Pascal
+/// SM 6.x and earlier) those kernels cannot be loaded by the driver, so the
+/// Rust callers below gate every WMMA FFI call on this probe and return a
+/// descriptive error instead of segfaulting inside the cubin loader.
+///
+/// We dlopen `libcuda.so` directly rather than going through `cudarc`
+/// because the CUDA driver API exposes `cuDeviceGetAttribute` for compute
+/// capability without requiring a context, and adapting cudarc's
+/// version-pinned API surface here would be brittle.  The result is cached
+/// in a `OnceLock` so the dlopen happens once per process.
+#[cfg(feature = "cuda")]
+fn has_wmma_support(_dev: &candle::CudaDevice) -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_wmma_support)
+}
+
+#[cfg(feature = "cuda")]
+fn probe_wmma_support() -> bool {
+    use libloading::{Library, Symbol};
+    type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+
+    #[cfg(target_os = "windows")]
+    let lib_names: &[&str] = &["nvcuda.dll"];
+    #[cfg(not(target_os = "windows"))]
+    let lib_names: &[&str] = &["libcuda.so.1", "libcuda.so"];
+
+    let lib = match lib_names
+        .iter()
+        .find_map(|name| unsafe { Library::new(name).ok() })
+    {
+        Some(l) => l,
+        None => return false,
+    };
+
+    let get_attr: Symbol<CuDeviceGetAttribute> =
+        match unsafe { lib.get(b"cuDeviceGetAttribute\0") } {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+    // inferrs is single-GPU; ordinal 0 matches `is_cuda_uma_platform` in
+    // inferrs/src/engine.rs.
+    let ordinal: i32 = 0;
+    let mut major: i32 = 0;
+    let r = unsafe {
+        get_attr(
+            &mut major,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            ordinal,
+        )
+    };
+    if r != 0 {
+        return false;
+    }
+    major >= 7
+}
+
 #[cfg(feature = "cuda")]
 pub fn moe_gemm(
     input: &Tensor,
@@ -42,6 +105,13 @@ pub fn moe_gemm(
             size_k
         );
         let dev = input.device().as_cuda_device()?;
+        if !has_wmma_support(dev) {
+            candle::bail!(
+                "moe_gemm requires a CUDA device with Tensor Core support \
+                 (compute capability >= 7.0); the active GPU is pre-Volta. \
+                 MoE inference is not yet supported on this hardware."
+            );
+        }
         let data_type = match input.dtype() {
             DType::F16 => 0,
             DType::BF16 => 1,
@@ -251,6 +321,14 @@ pub fn moe_gemm_gguf(
         use core::ffi::c_void;
 
         assert!(size_k % 8 == 0, "size_k must divisible by 8");
+        if is_prefill && !has_wmma_support(dev) {
+            candle::bail!(
+                "moe_gemm_gguf prefill requires a CUDA device with Tensor Core \
+                 support (compute capability >= 7.0); the active GPU is \
+                 pre-Volta. GGUF MoE prefill is not yet supported on this \
+                 hardware (decode still works)."
+            );
+        }
         unsafe {
             if is_prefill {
                 let input = input.to_dtype(dtype)?;

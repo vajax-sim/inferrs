@@ -15,22 +15,12 @@
  */
 
 // WMMA (Tensor Core) intrinsics require SM 7.0+ (Volta and later).
-// On older GPUs the build system defines INFERRS_NO_WMMA and this file
-// compiles to a no-op stub so the library still links.
-#ifdef INFERRS_NO_WMMA
-
-#include <cuda_runtime.h>
-#include <cstdint>
-
-extern "C" void moe_gemm_wmma(
-    const void*, const void*, const int32_t*, const int32_t*,
-    const float*, void*, int32_t*, int32_t*,
-    int, int, int, int, int, int, bool, cudaStream_t
-) {
-    // No-op: WMMA not available on this GPU architecture.
-}
-
-#else // INFERRS_NO_WMMA
+// This file is compiled by a dedicated bindgen_cuda::Builder pinned to a
+// WMMA-capable compute capability (see candle-kernels/build.rs). The Rust
+// layer in candle-nn/src/moe.rs gates callers on `has_wmma_support()`,
+// which probes the active GPU's compute capability via the CUDA driver
+// API at runtime, so this kernel is only launched on hardware that can
+// run it.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -300,5 +290,3 @@ extern "C" void moe_gemm_wmma(
         }
     }
 }
-
-#endif // INFERRS_NO_WMMA

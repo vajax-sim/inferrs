@@ -351,6 +351,7 @@ dependencies = [
  "candle-metal-kernels",
  "half",
  "libc",
+ "libloading 0.8.9",
  "num-traits",
  "objc2-metal",
  "rayon",

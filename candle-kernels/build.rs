@@ -1,85 +1,139 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Default WMMA target arch when the user doesn't override `INFERRS_WMMA_ARCH`.
+///
+/// We pick `70` (Volta) so that compute_70 PTX embedded in the WMMA lib JITs
+/// forward to every Tensor-Core arch in production today (V100, T4, A100,
+/// L4, H100, B200, ...). PTX cannot JIT *backwards*, so picking 75 here
+/// would silently break V100. Users who only care about Turing+ can set
+/// `INFERRS_WMMA_ARCH=75` (or higher) for marginally better SASS.
+const DEFAULT_WMMA_ARCH: usize = 70;
+
+/// Top-level (non-MoE) kernels that go through the PTX build path.
+const NON_MOE_KERNELS: &[&str] = &[
+    "src/affine.cu",
+    "src/binary.cu",
+    "src/cast.cu",
+    "src/conv.cu",
+    "src/fill.cu",
+    "src/flash_attn.cu",
+    "src/indexing.cu",
+    "src/quantized.cu",
+    "src/reduce.cu",
+    "src/sort.cu",
+    "src/ternary.cu",
+    "src/unary.cu",
+];
+
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
+    println!("cargo::rerun-if-env-changed=INFERRS_WMMA_ARCH");
+    println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
-    // WMMA (Tensor Core) intrinsics require SM 7.0+ (Volta).  When targeting
-    // older architectures (e.g. Pascal SM 6.x), pass -DINFERRS_NO_WMMA so the
-    // WMMA .cu files compile to no-op stubs instead of hitting undefined
-    // identifier errors for the nvcuda::wmma namespace.
-    //
-    // bindgen_cuda auto-detects the GPU compute capability via nvidia-smi and
-    // sets CUDA_COMPUTE_CAP for nested builder invocations, but during the
-    // *first* build_ptx() call the env var is not yet populated.  Replicate
-    // the same detection here so both the PTX build and the lib build agree.
-    let compute_cap: u32 = detect_compute_cap().unwrap_or(80);
-    let has_wmma = compute_cap >= 70;
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let main_cc = detect_compute_cap();
+    let wmma_arch: usize = env::var("INFERRS_WMMA_ARCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_WMMA_ARCH);
+
     println!(
-        "cargo:warning=candle-kernels: CUDA_COMPUTE_CAP={} has_wmma={}",
-        compute_cap, has_wmma
+        "cargo:warning=candle-kernels: main_cc={} wmma_cc={}",
+        main_cc
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "auto".into()),
+        wmma_arch
     );
 
-    // Build for PTX
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let is_target_msvc = env::var("TARGET")
+        .map(|t| t.contains("msvc"))
+        .unwrap_or(false);
+
+    // ------------------------------------------------------------------
+    // Builder #1 — main PTX build for everything except src/moe/*.cu.
+    // ------------------------------------------------------------------
+    //
+    // We override `kernel_paths` explicitly so the default `src/**/*.cu`
+    // glob doesn't drag the MoE files in. The MoE kernels live in their
+    // own static libs (Builders #2 and #3 below) and never need PTX.
     let ptx_path = out_dir.join("ptx.rs");
-    let mut builder = bindgen_cuda::Builder::default()
+    let ptx_builder = bindgen_cuda::Builder::default()
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
-        .arg("-O3");
-    if !has_wmma {
-        builder = builder.arg("-DINFERRS_NO_WMMA");
-    }
-    let bindings = builder.build_ptx().unwrap();
+        .arg("-O3")
+        .kernel_paths(NON_MOE_KERNELS.iter().map(PathBuf::from).collect());
+    let bindings = ptx_builder.build_ptx().unwrap();
     bindings.write(&ptx_path).unwrap();
 
-    // Remove unwanted MOE PTX constants from ptx.rs
-    remove_lines(&ptx_path, &["MOE_GGUF", "MOE_WMMA", "MOE_WMMA_GGUF"]);
-
-    let mut moe_builder = bindgen_cuda::Builder::default()
+    // ------------------------------------------------------------------
+    // Builder #2 — non-WMMA MoE static lib (libmoe_gguf.a).
+    // ------------------------------------------------------------------
+    //
+    // `moe_gguf.cu` is a CUDA-core (no Tensor Core) GGUF MoE decode
+    // kernel; it compiles cleanly on every arch we care about, so we
+    // let bindgen_cuda use the default compute-cap detection.
+    let mut gguf_builder = bindgen_cuda::Builder::default()
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
-        .arg("-O3");
-
-    if !has_wmma {
-        moe_builder = moe_builder.arg("-DINFERRS_NO_WMMA");
+        .arg("-O3")
+        .kernel_paths(vec![PathBuf::from("src/moe/moe_gguf.cu")]);
+    if is_target_msvc {
+        gguf_builder = gguf_builder.arg("-D_USE_MATH_DEFINES");
+    } else {
+        gguf_builder = gguf_builder.arg("-Xcompiler").arg("-fPIC");
     }
+    gguf_builder.build_lib(out_dir.join("libmoe_gguf.a"));
 
-    // Build for FFI binding (must use custom bindgen_cuda, which supports simutanously build PTX and lib)
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let mut is_target_msvc = false;
-    if let Ok(target) = std::env::var("TARGET") {
-        if target.contains("msvc") {
-            is_target_msvc = true;
-            moe_builder = moe_builder.arg("-D_USE_MATH_DEFINES");
-        }
+    // ------------------------------------------------------------------
+    // Builder #3 — WMMA MoE static lib (libmoe_wmma.a).
+    // ------------------------------------------------------------------
+    //
+    // `moe_wmma.cu` and `moe_wmma_gguf.cu` use the `nvcuda::wmma`
+    // intrinsics which require compute capability >= 7.0 to *compile*,
+    // even when targeting older hardware. We pin this Builder to a
+    // WMMA-capable arch (default sm_70) regardless of the host GPU.
+    //
+    // The runtime gate in candle-nn/src/moe.rs checks
+    // `CudaDevice::has_wmma()` before launching either of these kernels,
+    // so on a Pascal box the host-side wrappers stay linked but the
+    // sm_70 device code is never loaded.
+    let mut wmma_builder = bindgen_cuda::Builder::default()
+        .arg("--expt-relaxed-constexpr")
+        .arg("-std=c++17")
+        .arg("-O3")
+        .compute_cap(wmma_arch)
+        .kernel_paths(vec![
+            PathBuf::from("src/moe/moe_wmma.cu"),
+            PathBuf::from("src/moe/moe_wmma_gguf.cu"),
+        ]);
+    if is_target_msvc {
+        wmma_builder = wmma_builder.arg("-D_USE_MATH_DEFINES");
+    } else {
+        wmma_builder = wmma_builder.arg("-Xcompiler").arg("-fPIC");
     }
+    wmma_builder.build_lib(out_dir.join("libmoe_wmma.a"));
 
-    if !is_target_msvc {
-        moe_builder = moe_builder.arg("-Xcompiler").arg("-fPIC");
-    }
-
-    let moe_builder = moe_builder.kernel_paths(vec![
-        "src/moe/moe_gguf.cu",
-        "src/moe/moe_wmma.cu",
-        "src/moe/moe_wmma_gguf.cu",
-    ]);
-    moe_builder.build_lib(out_dir.join("libmoe.a"));
+    // ------------------------------------------------------------------
+    // Link both MoE libs plus the standard CUDA runtime.
+    // ------------------------------------------------------------------
     println!("cargo:rustc-link-search={}", out_dir.display());
-    println!("cargo:rustc-link-lib=moe");
+    println!("cargo:rustc-link-lib=moe_gguf");
+    println!("cargo:rustc-link-lib=moe_wmma");
     println!("cargo:rustc-link-lib=dylib=cudart");
     if !is_target_msvc {
         println!("cargo:rustc-link-lib=stdc++");
     }
 }
 
-/// Detect the CUDA compute capability the kernels will be built for.
+/// Detect the host GPU's CUDA compute capability for logging purposes.
 ///
-/// Mirrors what `bindgen_cuda` does internally: honour CUDA_COMPUTE_CAP if
-/// set, otherwise query nvidia-smi for the GPU's native capability.
+/// `bindgen_cuda` does its own detection internally for Builders that don't
+/// call `.compute_cap()`, so we only need this for the warning line.
 fn detect_compute_cap() -> Option<u32> {
     if let Ok(v) = env::var("CUDA_COMPUTE_CAP") {
         if let Ok(n) = v.parse::<u32>() {
@@ -98,14 +152,4 @@ fn detect_compute_cap() -> Option<u32> {
     // e.g. "6.1" -> 61
     let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
     digits.parse::<u32>().ok()
-}
-
-fn remove_lines<P: AsRef<std::path::Path>>(file: P, patterns: &[&str]) {
-    let content = std::fs::read_to_string(&file).unwrap();
-    let filtered = content
-        .lines()
-        .filter(|line| !patterns.iter().any(|p| line.contains(p)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(file, filtered).unwrap();
 }
