@@ -53,4 +53,37 @@ extern "C" {
         gguf_dtype: i32,  //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5  (for weights)
         stream: i64,
     );
+
+    // ------------------------------------------------------------------
+    // cuBLAS-backed MoE fallback for pre-Ampere GPUs.
+    // See candle-kernels/src/moe/moe_cublas_fallback.cu and
+    // candle-nn/src/moe_cublas.rs.
+    // ------------------------------------------------------------------
+
+    pub fn moe_cublas_gather(
+        input: *const c_void,          // device ptr [rows, size_k]
+        sorted_token_ids: *const i32,  // device ptr [size_m]
+        expert_ids: *const i32,        // device ptr [size_m]
+        a_packed: *mut c_void,         // device ptr out [size_m, size_k]
+        expert_counts: *mut i32,       // pre-alloc [num_experts]
+        expert_offsets: *mut i32,      // pre-alloc [num_experts + 1]
+        num_experts: i32,
+        topk_divisor: i32, // 1 if topk_weights is given, else `topk`
+        size_m: i32,
+        size_k: i32,
+        data_type: i32, // 0 = fp16, 1 = bf16
+        is_prefill: bool,
+        stream: i64,
+    );
+
+    pub fn moe_cublas_scatter(
+        c_packed: *const c_void,       // device ptr [size_m, size_n]
+        sorted_token_ids: *const i32,  // device ptr [size_m]
+        topk_weights: *const f32,      // device ptr [size_m] or nullptr
+        output: *mut c_void,           // device ptr [size_m, size_n]
+        size_m: i32,
+        size_n: i32,
+        data_type: i32,
+        stream: i64,
+    );
 }

@@ -113,11 +113,21 @@ pub fn moe_gemm(
         );
         let dev = input.device().as_cuda_device()?;
         if !has_wmma_support(dev) {
-            candle::bail!(
-                "moe_gemm requires a CUDA device with bf16 Tensor Core \
-                 support (compute capability >= 8.0, i.e. Ampere or newer). \
-                 The active GPU is pre-Ampere; MoE inference is not yet \
-                 supported on this hardware."
+            // Pre-Ampere GPUs cannot run the WMMA MoE kernels (compiled
+            // against sm_80 with bf16 Tensor Core fragments). Fall back
+            // to the cuBLAS-based gather → per-expert gemm → scatter
+            // implementation in `crate::moe_cublas`. This path is
+            // correctness-preserving but slower than the fused WMMA
+            // kernel; it exists so pre-Ampere hardware can run MoE
+            // models at all.
+            return crate::moe_cublas::moe_gemm_cublas(
+                input,
+                weights,
+                topk_weights,
+                sorted_token_ids,
+                experts_ids,
+                topk,
+                is_prefill,
             );
         }
         let data_type = match input.dtype() {

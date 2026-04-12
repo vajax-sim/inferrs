@@ -29,6 +29,8 @@ pub mod layer_norm;
 pub mod linear;
 pub mod loss;
 pub mod moe;
+#[cfg(feature = "cuda")]
+mod moe_cublas;
 pub mod ops;
 pub mod optim;
 pub mod rnn;

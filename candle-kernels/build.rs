@@ -86,13 +86,19 @@ fn main() {
     // ------------------------------------------------------------------
     //
     // `moe_gguf.cu` is a CUDA-core (no Tensor Core) GGUF MoE decode
-    // kernel; it compiles cleanly on every arch we care about, so we
-    // let bindgen_cuda use the default compute-cap detection.
+    // kernel; `moe_cublas_fallback.cu` provides gather/scatter kernels
+    // used by the pre-Ampere cuBLAS MoE fallback path in
+    // `candle-nn/src/moe_cublas.rs`. Neither file uses WMMA, so they
+    // compile cleanly on every arch we care about and we let
+    // bindgen_cuda use the default compute-cap detection.
     let mut gguf_builder = bindgen_cuda::Builder::default()
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3")
-        .kernel_paths(vec![PathBuf::from("src/moe/moe_gguf.cu")]);
+        .kernel_paths(vec![
+            PathBuf::from("src/moe/moe_gguf.cu"),
+            PathBuf::from("src/moe/moe_cublas_fallback.cu"),
+        ]);
     if is_target_msvc {
         gguf_builder = gguf_builder.arg("-D_USE_MATH_DEFINES");
     } else {
