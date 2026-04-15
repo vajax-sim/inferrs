@@ -40,6 +40,29 @@ jobs:
           done
           "${NVCC:-nvcc}" --version
 
+      - name: Detect GPU compute capability
+        run: |
+          # Query the GPU's compute capability and export it so
+          # candle-kernels/build.rs compiles WMMA kernels to matching SASS.
+          # Without this, DEFAULT_WMMA_ARCH=80 produces sm_80 SASS which
+          # only runs on Ampere — not on Blackwell (sm_120) or other arches.
+          RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+          echo "Detected GPU compute capability: sm_${RAW}"
+          echo "INFERRS_WMMA_ARCH=${RAW}" >> "$GITHUB_ENV"
+          echo "CUDA_COMPUTE_CAP=${RAW}" >> "$GITHUB_ENV"
+          # Blackwell (sm_120) requires CUDA toolkit >= 12.8. Warn early
+          # if the toolkit is too old.
+          NVCC_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+          echo "nvcc version: ${NVCC_VER}"
+          if [ "${RAW}" -ge 120 ]; then
+            MAJOR=$(echo "$NVCC_VER" | cut -d. -f1)
+            MINOR=$(echo "$NVCC_VER" | cut -d. -f2)
+            if [ "$MAJOR" -lt 12 ] || { [ "$MAJOR" -eq 12 ] && [ "$MINOR" -lt 8 ]; }; then
+              echo "::error::sm_${RAW} (Blackwell) requires CUDA >= 12.8 but found ${NVCC_VER}"
+              exit 1
+            fi
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -49,10 +72,9 @@ jobs:
       - name: Show GPU info
         run: nvidia-smi
 
-      # Let bindgen_cuda auto-detect the GPU's compute capability via
-      # nvidia-smi.  The WMMA .cu files now compile to no-op stubs on
-      # SM < 7.0 (via INFERRS_NO_WMMA), so this works on Pascal (6.1)
-      # as well as Volta+ GPUs.
+      # INFERRS_WMMA_ARCH and CUDA_COMPUTE_CAP are set above from the
+      # runner's actual GPU so both WMMA and non-WMMA kernels compile to
+      # the correct SASS.
       - name: Build (with CUDA backend)
         run: cargo build -p inferrs -p inferrs-backend-cuda
 
