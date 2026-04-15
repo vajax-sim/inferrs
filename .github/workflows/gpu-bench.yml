@@ -1,13 +1,11 @@
 name: GPU Bench
 
 on:
-  # Manual trigger with configurable model
   workflow_dispatch:
     inputs:
       model:
         description: 'HuggingFace model ID or local path on runner'
-        required: false
-        default: ''
+        required: true
       prompt_len:
         description: 'Number of synthetic prompt tokens'
         required: false
@@ -34,29 +32,11 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
+          dpkg -s pkg-config libssl-dev &>/dev/null || \
+            { sudo apt-get update -q && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev; }
 
-      - name: Set up CUDA environment
-        run: |
-          for d in /usr/local/cuda /opt/cuda /usr; do
-            if [ -x "$d/bin/nvcc" ]; then
-              echo "Found CUDA at $d"
-              echo "$d/bin" >> "$GITHUB_PATH"
-              echo "CUDA_PATH=$d" >> "$GITHUB_ENV"
-              echo "LIBRARY_PATH=$d/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-              echo "LD_LIBRARY_PATH=$d/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-              break
-            fi
-          done
-
-      - name: Detect GPU compute capability
-        run: |
-          RAW=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
-          echo "Detected GPU compute capability: sm_${RAW}"
-          echo "INFERRS_WMMA_ARCH=${RAW}" >> "$GITHUB_ENV"
-          echo "CUDA_COMPUTE_CAP=${RAW}" >> "$GITHUB_ENV"
+      - name: Set up CUDA + detect GPU
+        run: bash .github/scripts/cuda-setup.sh
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -64,16 +44,10 @@ jobs:
         with:
           key: gpu-bench
 
-      - name: GPU info
-        run: |
-          nvidia-smi
-          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
-
       - name: Build (release, CUDA backend)
         run: cargo build --release -p inferrs -p inferrs-backend-cuda
 
       - name: Run inferrs bench
-        if: inputs.model != ''
         run: |
           cargo run --release -p inferrs -- bench \
             --model "${{ inputs.model }}" \
@@ -82,22 +56,21 @@ jobs:
             --prompt-len "${{ inputs.prompt_len }}"
 
       - name: Run nsys profile
-        if: inputs.profile == 'true' && inputs.model != ''
+        if: inputs.profile == 'true'
         run: |
-          # Single-run nsys trace for kernel-level analysis
           nsys profile \
             --output /tmp/inferrs-bench-trace \
             --force-overwrite true \
             --trace cuda,nvtx \
             --sample none \
-            cargo run --release -p inferrs -- bench \
+            ./target/release/inferrs bench \
               --model "${{ inputs.model }}" \
               --warmup 0 \
               --runs 1 \
               --prompt-len "${{ inputs.prompt_len }}"
 
       - name: Upload nsys trace
-        if: inputs.profile == 'true' && inputs.model != ''
+        if: inputs.profile == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: nsys-trace
@@ -105,7 +78,7 @@ jobs:
           retention-days: 14
 
       - name: Kernel-level stats (nsys stats)
-        if: inputs.profile == 'true' && inputs.model != ''
+        if: inputs.profile == 'true'
         run: |
           nsys stats /tmp/inferrs-bench-trace.nsys-rep \
             --report gpukernsum \
