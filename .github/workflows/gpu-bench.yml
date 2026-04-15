@@ -1,0 +1,87 @@
+name: GPU Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'HuggingFace model ID or local path on runner'
+        required: true
+      prompt_len:
+        description: 'Number of synthetic prompt tokens'
+        required: false
+        default: '128'
+      runs:
+        description: 'Number of timed benchmark runs'
+        required: false
+        default: '5'
+      profile:
+        description: 'Run nsys profiling (true/false)'
+        required: false
+        default: 'false'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Benchmark (nvidia-runner-1)
+    runs-on: [self-hosted, Linux, X64, cuda]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          dpkg -s pkg-config libssl-dev &>/dev/null || \
+            { sudo apt-get update -q && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev; }
+
+      - name: Set up CUDA + detect GPU
+        run: bash .github/scripts/cuda-setup.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu-bench
+
+      - name: Build (release, CUDA backend)
+        run: cargo build --release -p inferrs -p inferrs-backend-cuda
+
+      - name: Run inferrs bench
+        run: |
+          cargo run --release -p inferrs -- bench \
+            --model "${{ inputs.model }}" \
+            --warmup 1 \
+            --runs "${{ inputs.runs }}" \
+            --prompt-len "${{ inputs.prompt_len }}"
+
+      - name: Run nsys profile
+        if: inputs.profile == 'true'
+        run: |
+          nsys profile \
+            --output /tmp/inferrs-bench-trace \
+            --force-overwrite true \
+            --trace cuda,nvtx \
+            --sample none \
+            ./target/release/inferrs bench \
+              --model "${{ inputs.model }}" \
+              --warmup 0 \
+              --runs 1 \
+              --prompt-len "${{ inputs.prompt_len }}"
+
+      - name: Upload nsys trace
+        if: inputs.profile == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsys-trace
+          path: /tmp/inferrs-bench-trace.*
+          retention-days: 14
+
+      - name: Kernel-level stats (nsys stats)
+        if: inputs.profile == 'true'
+        run: |
+          nsys stats /tmp/inferrs-bench-trace.nsys-rep \
+            --report gpukernsum \
+            --format csv \
+            --output /tmp/inferrs-kernel-stats || true
+          cat /tmp/inferrs-kernel-stats*.csv 2>/dev/null || echo "nsys stats not available"

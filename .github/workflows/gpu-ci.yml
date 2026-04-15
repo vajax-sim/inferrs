@@ -20,25 +20,11 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
+          dpkg -s pkg-config libssl-dev &>/dev/null || \
+            { sudo apt-get update -q && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev; }
 
-      - name: Set up CUDA environment
-        run: |
-          # Find the CUDA installation (common paths on self-hosted runners)
-          for d in /usr/local/cuda /opt/cuda /usr; do
-            if [ -x "$d/bin/nvcc" ]; then
-              echo "Found CUDA at $d"
-              echo "$d/bin" >> "$GITHUB_PATH"
-              echo "CUDA_PATH=$d" >> "$GITHUB_ENV"
-              echo "LIBRARY_PATH=$d/lib64:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-              echo "LD_LIBRARY_PATH=$d/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-              NVCC="$d/bin/nvcc"
-              break
-            fi
-          done
-          "${NVCC:-nvcc}" --version
+      - name: Set up CUDA + detect GPU
+        run: bash .github/scripts/cuda-setup.sh
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -46,13 +32,6 @@ jobs:
         with:
           key: gpu-ci
 
-      - name: Show GPU info
-        run: nvidia-smi
-
-      # Let bindgen_cuda auto-detect the GPU's compute capability via
-      # nvidia-smi.  The WMMA .cu files now compile to no-op stubs on
-      # SM < 7.0 (via INFERRS_NO_WMMA), so this works on Pascal (6.1)
-      # as well as Volta+ GPUs.
       - name: Build (with CUDA backend)
         run: cargo build -p inferrs -p inferrs-backend-cuda
 
